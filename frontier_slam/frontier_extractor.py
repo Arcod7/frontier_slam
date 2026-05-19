@@ -16,6 +16,7 @@ from builtin_interfaces.msg import Duration
 
 class FrontierExtractor(Node):
     MIN_CLUSTER_CELLS = 5   # discard clusters smaller than this
+    MIN_EXPLORE_DIST  = 3.0 # m — skip frontiers the robot is already at
     UPDATE_HZ = 0.5         # re-evaluate every 2 s
 
     def __init__(self):
@@ -77,7 +78,16 @@ class FrontierExtractor(Node):
         if not candidates:
             return
 
-        # Nearest centroid
+        # Ignore frontiers the robot is already standing in
+        candidates = [c for c in candidates if c[2] >= self.MIN_EXPLORE_DIST]
+        if not candidates:
+            self.get_logger().info(
+                'All frontiers within reach — scanning for new areas',
+                throttle_duration_sec=5.0,
+            )
+            return
+
+        # Nearest centroid that requires actual movement
         candidates.sort(key=lambda c: c[2])
         gx, gy, _, _ = candidates[0]
         gz = self._robot_pos[2]  # maintain current depth (2-D frontier on projected map)

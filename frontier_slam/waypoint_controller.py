@@ -39,14 +39,15 @@ def _wrap(a: float) -> float:
 
 
 class WaypointController(Node):
-    # P-gains — tune these after first run
-    KP_YAW   = 0.8
-    KP_SURGE = 0.4
-    KP_HEAVE = 0.5
+    # P-gains
+    KP_YAW   = 0.4
+    KP_SURGE = 0.25
+    KP_HEAVE = 0.3
 
-    GOAL_RADIUS    = 1.5   # m — stop commanding when within this radius
-    HEADING_THRESH = 0.3   # rad — allow surge only when heading error is below this
-    CTRL_HZ        = 10.0
+    MAX_SURGE   = 0.45  # hard cap on forward speed
+    GOAL_RADIUS = 2.0   # m
+    SCAN_YAW    = 0.08  # slow rotation while waiting for next frontier
+    CTRL_HZ     = 10.0
 
     def __init__(self):
         super().__init__('waypoint_controller')
@@ -74,25 +75,34 @@ class WaypointController(Node):
 
     # ------------------------------------------------------------------
     def _loop(self) -> None:
-        if self._goal is None or self._pose is None:
+        if self._pose is None:
+            return
+        if self._goal is None:
+            # No frontier yet — hold depth and scan to build initial map
+            self._mix_and_send(0.0, self.SCAN_YAW, 0.0)
             return
 
         dx, dy, dz = self._goal - self._pose
         dist_xy = math.hypot(dx, dy)
 
         if math.hypot(dist_xy, dz) < self.GOAL_RADIUS:
-            self._send([0.0] * 6)
-            self.get_logger().info('Goal reached — hovering', throttle_duration_sec=2.0)
+            # Hold depth + slow yaw scan while waiting for next frontier
+            heave_cmd = float(np.clip(self.KP_HEAVE * (-dz), -1.0, 1.0))
+            self._mix_and_send(0.0, self.SCAN_YAW, heave_cmd)
+            self.get_logger().info('Goal reached — scanning', throttle_duration_sec=2.0)
             return
 
-        desired_yaw  = math.atan2(dy, dx)
-        heading_err  = _wrap(desired_yaw - self._yaw)
+        desired_yaw = math.atan2(dy, dx)
+        heading_err = _wrap(desired_yaw - self._yaw)
 
-        yaw_cmd   = float(np.clip(self.KP_YAW   * heading_err, -1.0, 1.0))
-        surge_cmd = float(np.clip(self.KP_SURGE * dist_xy,     -1.0, 1.0)) \
-                    if abs(heading_err) < self.HEADING_THRESH else 0.0
-        # NED: positive Z is down, so diving increases Z → negate for heave up = positive
-        heave_cmd = float(np.clip(self.KP_HEAVE * (-dz),       -1.0, 1.0))
+        yaw_cmd = float(np.clip(self.KP_YAW * heading_err, -1.0, 1.0))
+        # Surge scales with heading alignment via cos — smooth curved approach,
+        # naturally zero when facing away, full when aligned, no hard threshold.
+        surge_cmd = float(np.clip(
+            self.KP_SURGE * dist_xy * max(0.0, math.cos(heading_err)),
+            0.0, self.MAX_SURGE,
+        ))
+        heave_cmd = float(np.clip(self.KP_HEAVE * (-dz), -1.0, 1.0))
 
         self._mix_and_send(surge_cmd, yaw_cmd, heave_cmd)
 
