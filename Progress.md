@@ -262,6 +262,68 @@ to the source `logs/` directory regardless of how the package is installed.
 
 ---
 
+## Change 12 — Depth-hold uses a fixed setpoint (Z drift fix)
+
+**Date**: 2026-05-19  
+**Files**: `waypoint_controller.py`, `frontier_extractor.py`
+
+**Objective**: Session 1 logs showed the robot sinking from 8.5 m to 13.8 m over 4 minutes
+even though every heave command was small (+0.00 to +0.06). The cause was a feedback
+loop in the goal-Z plumbing:
+
+```
+extractor: gz = robot.z       ← uses CURRENT robot z each cycle
+controller: heave = KP * (-(gz - pose.z))
+```
+
+When the robot drifted down between updates (2 s), the next frontier message brought a
+new, deeper `gz`. The depth error never grew large enough to trigger meaningful heave,
+so each cycle the controller accepted the drifted depth as the new target.
+
+**Fix**:
+- `WaypointController` now owns the depth setpoint. It is captured once on the first
+  odometry callback (`self._depth_setpoint = pose.z`) and held for the lifetime of the
+  node. The control law became `heave = KP_HEAVE * (pose.z - setpoint)`.
+- The goal's Z field is now ignored by the controller. The extractor still publishes
+  `gz = robot.z` but only so the RViz marker sits at the right height — it does not
+  influence the depth controller.
+- `KP_HEAVE` bumped from 0.30 → 0.40 to give a bit more authority against any
+  persistent buoyancy bias.
+
+**Observed impact**: 🔲 Not yet tested.
+
+---
+
+## Change 13 — Refactor: split into focused modules
+
+**Date**: 2026-05-19  
+**Files**: new `session_log.py`, `frontier_detection.py`, `goal_manager.py`,
+`control_utils.py`; rewritten `frontier_extractor.py`, `waypoint_controller.py`
+
+**Objective**: Both node files had grown to mix several unrelated concerns (frontier
+detection + goal state + viz + CSV logging in one; thruster mixing + control law +
+CSV logging in the other). The single update/loop methods were 80+ lines.
+
+**Structure**:
+```
+frontier_slam/
+├── frontier_extractor.py     # node: orchestration, ROS I/O, marker viz
+├── waypoint_controller.py    # node: orchestration, ROS I/O, control loop
+├── frontier_detection.py     # pure: OccupancyGrid → list[Cluster]
+├── goal_manager.py           # state: hysteresis, stuck detection, blacklist
+├── control_utils.py          # pure: yaw_from_quat, wrap_angle, mix_thrusters
+└── session_log.py            # shared: CSV opener + float-formatting writer
+```
+
+**Behavioural guarantees**: refactor only — no algorithmic changes alongside Change 12.
+Same constants, same control law, same selection rules. Identical CSV schemas
+(controller gained one column: `depth_err_m`).
+
+**Observed impact**: 🔲 Not yet tested. Equivalent behaviour expected; regression risk
+limited to the goal-selection plumbing in `GoalManager.select()`.
+
+---
+
 ## Current parameter snapshot
 
 ### frontier_extractor.py
@@ -281,7 +343,7 @@ to the source `logs/` directory regardless of how the package is installed.
 |---|---|---|
 | `KP_YAW` | 0.04 | Heading P-gain |
 | `KP_SURGE` | 0.25 | Forward speed P-gain |
-| `KP_HEAVE` | 0.3 | Vertical speed P-gain |
+| `KP_HEAVE` | 0.40 | Depth-hold P-gain (Change 12) |
 | `MAX_SURGE` | 0.40 | Surge clamp |
 | `GOAL_RADIUS` | 2.0 m | "Goal reached" threshold |
 | `SCAN_YAW` | 0.008 | Slow yaw rotation when hovering |
