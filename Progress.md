@@ -408,6 +408,32 @@ Timer reset on new goal confirmed by clean re-acquisition at start of session.
 
 ---
 
+## Change 19 — Frontier scoring: prefer large clusters over nearest cluster
+
+**Date**: 2026-05-19  
+**Files**: `goal_manager.py`
+
+**Objective**: Session 7 showed the robot looping for 231s between two equidistant frontier
+clusters (A and B at opposite corridor ends), gaining only 74 new cells. The root cause:
+`candidates.sort(key=lambda c: c.distance)` gives equal weight to any two clusters at the
+same distance regardless of size. When the large unexplored installation is 18m away and a
+small 4-cell boundary patch is 15m away, nearest-first picks the patch every time.
+
+**Fix**: Change sort key to `c.distance / c.size` (ascending = best first). A cluster of
+50 cells at 18m scores 0.36; a cluster of 4 cells at 15m scores 3.75. The robot now
+consistently heads toward the information-rich region.
+
+Side effect: noise immunity. OccupancyGrid noise creates phantom clusters of 5–8 cells
+in already-explored areas. These score poorly vs genuine large frontiers — the robot
+ignores them without any additional filtering.
+
+The mid-journey hysteresis (`switch_hysteresis = 3.0m`) is intentionally kept distance-based:
+it prevents abandoning a large distant goal for a small nearby distraction mid-journey.
+
+**Observed impact**: 🔲 Not yet tested.
+
+---
+
 ## Change 18 — Obstacle escape: forced yaw when BLOCKED + position-stuck detection
 
 **Date**: 2026-05-19  
@@ -466,7 +492,9 @@ cycle. Three new columns added to `extractor.csv`:
 `mapped_cells` is the primary coverage metric: it grows as the robot explores and
 plateaus when exploration stalls. Also printed in the extractor's per-cycle ROS log line.
 
-**Observed impact**: 🔲 Not yet tested.
+**Observed impact**: ✅ Session 7 (`2026-05-19_15-55-06`): `mapped_cells` tracked continuously
+from 15,348 at session start to 27,151 at plateau. Growth rate visible in CSV (fast early,
+then near-zero after t≈135s). Used to confirm the back-and-forth loop in phase 4.
 
 ---
 
@@ -517,6 +545,7 @@ Raw logs go in `logs/`. From Change 11 onward, CSV files are generated automatic
 | `2026-05-19_15-22-50_*.csv` | 2026-05-19 | Session 4. BLOCKED at (6.04,−0.05) with obs=0.20m from t=+6s to end (80+ seconds frozen). yaw_cmd=0.00 throughout — aligned BLOCKED with no escape. |
 | `2026-05-19_15-40-14_*.csv` | 2026-05-19 | Session 5. BLOCKED at (5.70, 0.56) obs=0.25m for 60+ seconds, then BLOCKED again at (13.88,−0.31). Same aligned-BLOCKED pattern; change 18 not yet applied. |
 | `2026-05-19_15-43-04_*.csv` | 2026-05-19 | Session 6. Two failure modes: (1) brief BLOCKED at (5.7,0) cleared by goal change, (2) physical stuck at (9.88,−1.71) for 35+ seconds with obs=2.4m — off-axis wall not in camera FOV. Root cause of Ch18. |
+| `2026-05-19_15-55-06_*.csv` | 2026-05-19 | Session 7. 366s. Ch18 confirmed: all BLOCKED events clear in 1–2 ticks. 27,151 mapped cells (2.2× session 6). 89% of coverage in first 55s. Final 231s stuck in y≈9.9 loop — nearest-first oscillation. Slow depth drift (err 0→0.55m). |
 
 ---
 
@@ -589,3 +618,71 @@ sensor range; as the robot mapped the near field, small residual patches dropped
 genuinely no structure ahead to generate new unknown cells.
 The robot needs to rotate and move to discover new frontiers — which Change 15 enables.
 If scanning also fails to find frontiers, `MIN_CLUSTER_CELLS` may need lowering.
+
+---
+
+## Session 7 — Findings (2026-05-19)
+
+**Duration**: 366s (~6 minutes)  
+**Files**: `logs/2026-05-19_15-55-06_*.csv`
+
+### What worked
+
+- **Obstacle escape (Ch18)** ✅: Every BLOCKED event resolved in 1–2 ticks. Sessions 4–5
+  had BLOCKED lasting 80+ seconds. Here the worst case was 2 consecutive ticks (2s), then
+  `obs` jumped from 0.30m to 1.95m. Zero time wasted frozen against a pillar.
+- **Coverage** ✅: 27,151 `mapped_cells` — 2.2× the previous session (12,412). Robot
+  explored corridors above (y≈9–10) and south (y≈−7) that had never been reached before.
+- **Navigation** ✅: Robot moved cleanly at max surge across the full environment with no
+  collisions. Heading error typically < 5° during straight runs.
+
+### Phase breakdown
+
+| Phase | t range | mapped_cells | Robot behaviour |
+|---|---|---|---|
+| 1 — Active exploration | 0–55s | 15,348 → 24,157 | Fast goal-switching across 4 corridors; 89% of total coverage |
+| 2 — S/N oscillation | 55–90s | 24,157 → 24,739 | Loop between south goal (y≈−7) and north goal (y≈6.8) |
+| 3 — New territory | 90–135s | 24,739 → 27,077 | Robot reaches y≈9–10 corridor for first time |
+| 4 — Tight corridor loop | 135–366s | 27,077 → 27,151 | 231s in 5m strip, only 74 new cells |
+
+### Issues observed
+
+**1. Back-and-forth loop — nearest-first selection oscillates (critical)**  
+In phase 4 the robot locks between goals A=(9.90,8.80) and B=(−2.00 to −3.40,9.80),
+±100° heading changes every ~12 seconds. Nearest-first selection picks them alternately
+because they are equidistant from the robot's midpoint. The GoalManager's
+`SWITCH_HYSTERESIS=3.0m` does not help: it only applies while actively pursuing a goal,
+but `GOAL_REACHED` fires and clears `_goal` before the 10s timeout, so each new dispatch
+starts fresh. The extractor at 0.5 Hz republishes before the timeout can fire.  
+`CTRL_STUCK` does not help either: the robot IS moving 0.25m+ every 5s — it physically
+covers the corridor, just not new territory.
+
+Root cause: nearest-first scoring has no preference for information gain. Two equidistant
+clusters of very different sizes receive equal priority.
+
+**Potential fix**: Score frontiers by `cluster_size / distance`. A cluster with 20 cells
+at 8m beats a cluster with 3 cells at 7m. This breaks equidistance ties toward the more
+informative direction and naturally deprioritises tiny residual boundary patches.
+See FutureWork §1.
+
+**2. Slow depth drift**  
+`depth_err` grows from 0.01m at start to 0.55m by t=135s, then stays there.
+Heave output reaches −0.20 (full upward thrust at 0.5m error) but cannot fully
+counteract the drift. Likely cause: pitch coupling during aggressive surge — forward
+thrust creates a slight nose-down moment, pushing the robot deeper. The setpoint is
+locked correctly; the controller just can't overcome the physical effect.
+Not critical at current scale but will worsen in longer sessions or deeper environments.
+
+**3. Yaw speed during goal switches**  
+On each goal switch (±100°), `yaw_cmd ≈ ±0.17–0.18`. This is fast but below the ESCAPE_YAW
+cap. The user's "turns too fast" observation likely refers to ESCAPE_YAW=0.40 firing when
+BLOCKED — which is correct behaviour and should stay. Navigation yaw at KP_YAW=0.10
+produces smooth turns for small errors but snappy large-angle corrections.
+
+### Key insight: when does exploration actually happen?
+
+89% of session coverage (8,809 cells) was gained in the first 55 seconds. The rest of
+the 5-minute session contributed only 2,994 cells. The bottleneck is not obstacle avoidance
+or navigation — it is goal selection. Nearest-first with 23 equidistant clusters generates
+a random walk among visited frontiers rather than directing the robot toward large unknown
+regions. Frontier scoring is the next necessary change.

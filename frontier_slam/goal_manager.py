@@ -69,7 +69,10 @@ class GoalManager:
         if not candidates:
             return GoalSelection(float('nan'), float('nan'), 0, 'ALL_BLACKLISTED')
 
-        candidates.sort(key=lambda c: c.distance)
+        # Score = distance / size: prefer large clusters and close ones equally.
+        # This breaks ties between equidistant clusters in favour of the more
+        # information-rich one, and naturally deprioritises tiny noise patches.
+        candidates.sort(key=lambda c: c.distance / c.size)
 
         stuck_info = self._check_and_blacklist_if_stuck(candidates, robot_xy, now)
         event = 'STUCK_BLACKLIST' if stuck_info else ''
@@ -101,27 +104,28 @@ class GoalManager:
         return info
 
     def _pick_with_hysteresis(self, candidates, robot_xy, now):
-        nearest = candidates[0]
+        best = candidates[0]   # best-scored: smallest distance/size
         if self._committed is None:
-            self._commit(nearest.wx, nearest.wy, robot_xy, now)
-            return nearest.wx, nearest.wy
+            self._commit(best.wx, best.wy, robot_xy, now)
+            return best.wx, best.wy
 
         # Has the committed goal moved with the map? Find candidates near it.
         near_old = [c for c in candidates
                     if np.hypot(c.wx - self._committed[0], c.wy - self._committed[1])
                     < self.goal_vanish_dist]
         if not near_old:
-            # The committed goal vanished — pick the nearest fresh candidate.
-            self._commit(nearest.wx, nearest.wy, robot_xy, now)
-            return nearest.wx, nearest.wy
+            # The committed goal vanished — pick the best-scored fresh candidate.
+            self._commit(best.wx, best.wy, robot_xy, now)
+            return best.wx, best.wy
 
-        # The committed goal is still around. Only switch if the new best is
-        # clearly closer than where we already are.
+        # The committed goal is still around. Only switch if the best-scored candidate
+        # is also clearly closer (by distance) than where we already are — prevents
+        # abandoning a large-cluster goal mid-journey for a small nearby distraction.
         committed_dist = np.hypot(self._committed[0] - robot_xy[0],
                                   self._committed[1] - robot_xy[1])
-        if nearest.distance < committed_dist - self.switch_hysteresis:
-            self._commit(nearest.wx, nearest.wy, robot_xy, now)
-            return nearest.wx, nearest.wy
+        if best.distance < committed_dist - self.switch_hysteresis:
+            self._commit(best.wx, best.wy, robot_xy, now)
+            return best.wx, best.wy
 
         # Otherwise track drift of the committed goal without resetting the stuck timer.
         drift = min(near_old, key=lambda c: np.hypot(c.wx - self._committed[0],
