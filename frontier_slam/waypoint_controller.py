@@ -44,17 +44,23 @@ CSV_COLUMNS = [
 
 class WaypointController(Node):
     # P-gains
-    KP_YAW   = 0.04
+    KP_YAW   = 0.10
     KP_SURGE = 0.25
     KP_HEAVE = 0.40    # bumped from 0.30 — needs to fight persistent downward drift
 
-    MAX_SURGE          = 0.40
-    GOAL_RADIUS        = 2.0    # m
-    SCAN_YAW           = 0.008  # slow rotation while hovering on a reached goal
-    OBSTACLE_SLOW_DIST = 2.5    # m — start reducing surge below this
-    OBSTACLE_STOP_DIST = 0.8    # m — cut surge to zero below this
-    CTRL_HZ            = 10.0
-    LOG_EVERY_N_TICKS  = 10     # CSV row rate = CTRL_HZ / this  → 1 Hz
+    MAX_SURGE           = 0.40
+    GOAL_RADIUS         = 2.0    # m
+    GOAL_REACHED_TIMEOUT = 10.0  # s — clear stale goal and enter scan after this long
+    SCAN_YAW            = 0.08   # rotation speed while scanning (10× KP_YAW nav max)
+    OBSTACLE_SLOW_DIST  = 2.5    # m — start reducing surge below this
+    OBSTACLE_STOP_DIST  = 0.8    # m — cut surge to zero below this
+    ESCAPE_YAW          = 0.40   # spin rate for both sensor-blocked and position-stuck escape
+    ESCAPE_DURATION     = 4.0    # s — how long to spin after a stuck trigger
+    STUCK_SURGE_MIN     = 0.15   # min surge to consider "trying to move"
+    STUCK_WINDOW        = 5.0    # s — detection window
+    STUCK_MOVE_MIN      = 0.25   # m — minimum movement expected in STUCK_WINDOW
+    CTRL_HZ             = 10.0
+    LOG_EVERY_N_TICKS   = 10     # CSV row rate = CTRL_HZ / this  → 1 Hz
 
     def __init__(self):
         super().__init__('waypoint_controller')
@@ -64,6 +70,10 @@ class WaypointController(Node):
         self._yaw  = 0.0
         self._min_front_dist = float('inf')
         self._depth_setpoint: float | None = None
+        self._goal_reached_at: float | None = None
+        self._stuck_ref_pos: np.ndarray | None = None
+        self._stuck_ref_t:   float | None = None
+        self._escape_until:  float | None = None
         self._tick = 0
 
         self._log = open_session_log('controller', CSV_COLUMNS, _LOG_DIR)
@@ -91,6 +101,9 @@ class WaypointController(Node):
     def _goal_cb(self, msg: PointStamped) -> None:
         # Goal Z is intentionally ignored — depth is owned by this node.
         self._goal = np.array([msg.point.x, msg.point.y, msg.point.z])
+        self._goal_reached_at = None
+        self._stuck_ref_pos = None   # reset stuck window — new goal, fresh start
+        self._stuck_ref_t   = None
 
     def _odom_cb(self, msg: Odometry) -> None:
         p = msg.pose.pose.position
@@ -154,6 +167,16 @@ class WaypointController(Node):
         dist_xy = float(np.hypot(self._goal[0] - self._pose[0],
                                  self._goal[1] - self._pose[1]))
         if dist_xy < self.GOAL_RADIUS:
+            now = self._t_ros()
+            if self._goal_reached_at is None:
+                self._goal_reached_at = now
+            elif now - self._goal_reached_at > self.GOAL_REACHED_TIMEOUT:
+                self.get_logger().info(
+                    f'No new goal after {self.GOAL_REACHED_TIMEOUT:.0f}s — clearing goal, entering scan'
+                )
+                self._goal = None
+                self._goal_reached_at = None
+                # next tick will enter the _goal is None branch (scan mode)
             self._send_thrust(0.0, self.SCAN_YAW, heave)
             self.get_logger().info('Goal reached — scanning', throttle_duration_sec=2.0)
             if write_csv:
@@ -162,6 +185,54 @@ class WaypointController(Node):
             return
 
         surge_cmd, yaw_cmd, _, heading_err, blocked = self._xy_drive(self._goal[:2])
+        now = self._t_ros()
+        event = ''
+
+        # Active escape spin — finishes before resuming normal drive
+        if self._escape_until is not None:
+            if now < self._escape_until:
+                self._send_thrust(0.0, self.ESCAPE_YAW, heave)
+                if write_csv:
+                    self._write_csv(0.0, self.ESCAPE_YAW, heave, blocked, 'STUCK_ESCAPE',
+                                    dist=dist_xy, hdg_err_deg=math.degrees(heading_err))
+                return
+            self._escape_until = None
+            self._stuck_ref_pos = None
+            self._stuck_ref_t   = None
+
+        # When sensor-blocked, spin hard toward goal heading instead of drifting
+        if blocked:
+            yaw_cmd = (1.0 if heading_err >= 0 else -1.0) * self.ESCAPE_YAW
+            event = 'BLOCKED'
+
+        # Position-stuck detection: if we push hard but barely move, trigger escape
+        if surge_cmd >= self.STUCK_SURGE_MIN:
+            if self._stuck_ref_pos is None:
+                self._stuck_ref_pos = self._pose.copy()
+                self._stuck_ref_t   = now
+            else:
+                moved = float(np.hypot(self._pose[0] - self._stuck_ref_pos[0],
+                                       self._pose[1] - self._stuck_ref_pos[1]))
+                if moved >= self.STUCK_MOVE_MIN:
+                    self._stuck_ref_pos = self._pose.copy()
+                    self._stuck_ref_t   = now
+                elif now - self._stuck_ref_t >= self.STUCK_WINDOW:
+                    self.get_logger().warn(
+                        f'CTRL_STUCK: {moved:.2f}m in {self.STUCK_WINDOW:.0f}s at '
+                        f'({self._pose[0]:.1f},{self._pose[1]:.1f}) — escape spin'
+                    )
+                    self._escape_until = now + self.ESCAPE_DURATION
+                    self._stuck_ref_pos = None
+                    self._stuck_ref_t   = None
+                    self._send_thrust(0.0, self.ESCAPE_YAW, heave)
+                    if write_csv:
+                        self._write_csv(0.0, self.ESCAPE_YAW, heave, blocked, 'CTRL_STUCK',
+                                        dist=dist_xy, hdg_err_deg=math.degrees(heading_err))
+                    return
+        else:
+            self._stuck_ref_pos = None
+            self._stuck_ref_t   = None
+
         self._send_thrust(surge_cmd, yaw_cmd, heave)
 
         self.get_logger().info(
@@ -170,13 +241,12 @@ class WaypointController(Node):
             f'dist={dist_xy:.1f}m  hdg_err={math.degrees(heading_err):+.0f}°  '
             f'surge={surge_cmd:.2f}  yaw={yaw_cmd:+.3f}  heave={heave:+.2f}  '
             f'obs={self._min_front_dist:.1f}m'
-            + ('  [BLOCKED]' if blocked else ''),
+            + (f'  [{event}]' if event else ''),
             throttle_duration_sec=2.0,
         )
 
         if write_csv:
-            self._write_csv(surge_cmd, yaw_cmd, heave, blocked,
-                            'BLOCKED' if blocked else '',
+            self._write_csv(surge_cmd, yaw_cmd, heave, blocked, event,
                             dist=dist_xy, hdg_err_deg=math.degrees(heading_err))
 
     # ------------------------------------------------------------------

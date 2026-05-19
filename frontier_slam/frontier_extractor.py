@@ -35,7 +35,8 @@ _LOG_DIR = os.path.join(
 
 CSV_COLUMNS = [
     't_ros', 'rx', 'ry', 'rz', 'gx', 'gy',
-    'dist_m', 'clusters', 'stuck_pct', 'blacklist_n', 'event',
+    'dist_m', 'clusters', 'stuck_pct', 'blacklist_n',
+    'free_cells', 'occ_cells', 'mapped_cells', 'event',
 ]
 
 
@@ -81,10 +82,21 @@ class FrontierExtractor(Node):
         return self.get_clock().now().nanoseconds * 1e-9
 
     # ------------------------------------------------------------------
+    # Map statistics
+    def _map_stats(self) -> tuple[int, int, int]:
+        """Return (free_cells, occupied_cells, mapped_cells) from current map."""
+        data = np.asarray(self._map.data, dtype=np.int8)
+        free = int(np.sum(data == 0))
+        occ  = int(np.sum(data == 100))
+        return free, occ, free + occ
+
+    # ------------------------------------------------------------------
     # Main loop
     def _update(self) -> None:
         if self._map is None or self._robot_pos is None:
             return
+
+        free_cells, occ_cells, mapped_cells = self._map_stats()
 
         clusters = find_frontier_clusters(self._map, self.MIN_CLUSTER_CELLS)
         if not clusters:
@@ -118,7 +130,8 @@ class FrontierExtractor(Node):
                 'All candidates blacklisted — waiting', throttle_duration_sec=5.0,
             )
             self._write_csv(float('nan'), float('nan'), float('nan'),
-                            len(clusters), 0, 'ALL_BLACKLISTED')
+                            len(clusters), 0,
+                            free_cells, occ_cells, mapped_cells, 'ALL_BLACKLISTED')
             return
 
         self._publish_goal(selection.gx, selection.gy, clusters)
@@ -128,10 +141,12 @@ class FrontierExtractor(Node):
             f'robot=({self._robot_pos[0]:.1f},{self._robot_pos[1]:.1f},{self._robot_pos[2]:.1f})  '
             f'goal=({selection.gx:.1f},{selection.gy:.1f})  dist={dist:.1f}m  '
             f'clusters={len(clusters)}  stuck={selection.stuck_pct}%  '
-            f'blacklist={self._goals.blacklist_size}'
+            f'blacklist={self._goals.blacklist_size}  '
+            f'mapped={mapped_cells}(free={free_cells},occ={occ_cells})'
         )
         self._write_csv(selection.gx, selection.gy, dist,
-                        len(clusters), selection.stuck_pct, selection.event)
+                        len(clusters), selection.stuck_pct,
+                        free_cells, occ_cells, mapped_cells, selection.event)
 
     # ------------------------------------------------------------------
     # Publishing
@@ -180,13 +195,15 @@ class FrontierExtractor(Node):
 
     # ------------------------------------------------------------------
     # Logging
-    def _write_csv(self, gx, gy, dist, n_clusters, stuck_pct, event) -> None:
+    def _write_csv(self, gx, gy, dist, n_clusters, stuck_pct,
+                   free_cells, occ_cells, mapped_cells, event) -> None:
         rp = self._robot_pos
         self._log.write([
             self._now(),
             float(rp[0]), float(rp[1]), float(rp[2]),
             float(gx), float(gy), float(dist),
-            n_clusters, stuck_pct, self._goals.blacklist_size, event,
+            n_clusters, stuck_pct, self._goals.blacklist_size,
+            free_cells, occ_cells, mapped_cells, event,
         ])
 
 

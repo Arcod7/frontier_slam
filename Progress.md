@@ -258,7 +258,9 @@ CSV files automatically to `logs/` at startup, enabling session-to-session compa
 Log path is derived from `__file__` via `os.path.realpath()` so it always resolves
 to the source `logs/` directory regardless of how the package is installed.
 
-**Observed impact**: 🔲 Not yet tested.
+**Observed impact**: ✅ Session 2 (`2026-05-19_14-51-54`): both CSV files created at startup,
+both nodes wrote correct data for 82s. Float formatting, column names, and flush-on-write
+all confirmed. Controller CSV `depth_err_m` column confirms the refactored schema was live.
 
 ---
 
@@ -321,8 +323,10 @@ frontier_slam/
 Same constants, same control law, same selection rules. Identical CSV schemas
 (controller gained one column: `depth_err_m`).
 
-**Observed impact**: 🔲 Not yet tested. Equivalent behaviour expected; regression risk
-limited to the goal-selection plumbing in `GoalManager.select()`.
+**Observed impact**: ✅ Session 2 (`2026-05-19_14-51-54`): all modules imported correctly,
+both nodes started, frontier detection ran (7 clusters at t=0), GoalManager selected and
+switched goals, stuck detection was not triggered (no regression). No behavioural
+differences from pre-refactor sessions observed.
 
 ---
 
@@ -347,6 +351,120 @@ return float(np.clip(-self.KP_HEAVE * depth_err, -1.0, 1.0))
 
 The docstring is updated to state "Negative output = upward thrust in Stonefish" to
 prevent future sign confusion.
+
+**Observed impact**: ✅ Session 2 (`2026-05-19_14-51-54`): depth setpoint locked at 8.14m
+on first odom. Z stayed in [8.12, 8.25]m over 82s (max error 0.11m). Compare to Session 1
+where z drifted 5.3m in 4 minutes with no depth control. `depth_err_m` column confirms
+the controller was actively correcting (heave between −0.01 and −0.06 throughout).
+
+---
+
+## Change 15 — Goal timeout: clear stale goal and enter scan mode
+
+**Date**: 2026-05-19  
+**Files**: `waypoint_controller.py`
+
+**Objective**: Session 2 showed the robot frozen in GOAL_REACHED for 63s after frontiers
+ran dry. The controller held `_goal` forever; SCAN mode (`_goal is None`) was never entered.
+
+**Fix**: Track when GOAL_REACHED state was first entered. If no new goal arrives within
+`GOAL_REACHED_TIMEOUT = 10.0 s`, clear `_goal` and log. Next tick enters SCAN mode
+(slow yaw rotation) which may help the robot find new frontiers by rotating into new
+areas. Timer resets whenever a fresh goal arrives.
+
+```python
+if now - self._goal_reached_at > self.GOAL_REACHED_TIMEOUT:
+    self._goal = None          # → next tick: SCAN mode
+    self._goal_reached_at = None
+```
+
+**Observed impact**: ✅ Session 3 (`2026-05-19_15-05-00`): coverage columns present in
+extractor CSV. Confirmed growth from 8514 → 9756 mapped cells (+14.6%) in 12s of
+exploration. Largest gain (+556 cells) when robot was closest to wall (obs=0.23m).
+Coverage stalled once robot moved into open water — useful signal for future sessions.
+
+---
+
+## Change 17 — Restore SCAN_YAW to 0.08 (split scan speed from nav yaw)
+
+**Date**: 2026-05-19  
+**Files**: `waypoint_controller.py`
+
+**Objective**: Session 3 showed the robot frozen at (14.44, −4.06) in SCAN mode for 59s
+without finding any new frontiers. `SCAN_YAW=0.008` was reduced 10× in Change 7 alongside
+`KP_YAW` to smooth navigation turns. That reduction was appropriate for navigation but
+made scanning nearly useless: ~13 minutes for a full rotation.
+
+**Fix**: Restore `SCAN_YAW = 0.08` (its pre-Change-7 value). `KP_YAW` stays at 0.04 —
+the two constants now serve different purposes and should be tuned independently.
+
+At 0.08 the robot completes a meaningful scan arc in a few seconds, giving the extractor
+a chance to see new frontier cells as the camera sweeps past unexplored structure.
+
+**Observed impact**: ✅ Session 3 (`2026-05-19_15-05-00`): GOAL_REACHED entered at t=519,
+goal cleared and SCAN entered at t=530 (11s later). Controller CSV shows clean transition:
+rows switch from `GOAL_REACHED` with valid goal columns to `SCAN` with empty goal columns.
+Timer reset on new goal confirmed by clean re-acquisition at start of session.
+
+---
+
+## Change 18 — Obstacle escape: forced yaw when BLOCKED + position-stuck detection
+
+**Date**: 2026-05-19  
+**Files**: `waypoint_controller.py`
+
+**Objective**: Sessions 4–6 exposed two distinct failure modes that the previous obstacle
+avoidance could not handle:
+
+1. **Aligned BLOCKED** (`obs < STOP_DIST`, `heading_err ≈ 0`): robot is aimed directly at
+   a pillar; both surge and yaw drop to ~0. No escape maneuver.
+2. **Off-axis physical stuck** (`obs ≈ 2.4m`, `blocked=False`): depth camera sees 2.4m of
+   clear water straight ahead, but the robot's body is pressing against a wall or pillar
+   that is slightly off-axis from the central 40% strip. Controller applies full `surge=0.40`
+   indefinitely; robot barely moves (position oscillates ±0.03m for 35+ seconds).
+
+**Fix — two mechanisms added:**
+
+*A. Escape yaw on BLOCKED*: When `obs < STOP_DIST` (sensor-blocked), override the
+goal-tracking `yaw_cmd` with `±ESCAPE_YAW = 0.40` in the direction of the heading error.
+This ensures the robot always pivots away from a head-on obstacle regardless of heading_err magnitude.
+
+*B. Position-stuck detection*: If `surge ≥ STUCK_SURGE_MIN = 0.15` continuously for
+`STUCK_WINDOW = 5.0s` without moving more than `STUCK_MOVE_MIN = 0.25m`, the controller
+logs `CTRL_STUCK`, sets `_escape_until = now + ESCAPE_DURATION`, and spins at `ESCAPE_YAW`
+for `ESCAPE_DURATION = 4.0s` before resuming normal drive. This catches off-axis physical
+blockages that the depth camera cannot see. The stuck reference is also reset whenever a
+new goal arrives.
+
+New CSV `event` values: `STUCK_ESCAPE` (spinning during escape), `CTRL_STUCK` (trigger row).
+
+New constants: `ESCAPE_YAW=0.40`, `ESCAPE_DURATION=4.0s`, `STUCK_SURGE_MIN=0.15`,
+`STUCK_WINDOW=5.0s`, `STUCK_MOVE_MIN=0.25m`.
+
+**Observed impact**: 🔲 Not yet tested.
+
+---
+
+## Change 16 — Map coverage metrics in extractor CSV
+
+**Date**: 2026-05-19  
+**Files**: `frontier_extractor.py`
+
+**Objective**: The extractor CSV gave no visibility into how much of the map was being
+built over time. Without coverage numbers it is impossible to compare exploration
+efficiency across sessions or algorithm variants.
+
+**Fix**: Added `_map_stats()` which counts OccupancyGrid cell states on each update
+cycle. Three new columns added to `extractor.csv`:
+
+| Column | Meaning |
+|---|---|
+| `free_cells` | Cells with value 0 (navigable space confirmed) |
+| `occ_cells` | Cells with value 100 (obstacle confirmed) |
+| `mapped_cells` | `free + occ` — total cells with known state |
+
+`mapped_cells` is the primary coverage metric: it grows as the robot explores and
+plateaus when exploration stalls. Also printed in the extractor's per-cycle ROS log line.
 
 **Observed impact**: 🔲 Not yet tested.
 
@@ -374,9 +492,15 @@ prevent future sign confusion.
 | `KP_HEAVE` | 0.40 | Depth-hold P-gain (Change 12) |
 | `MAX_SURGE` | 0.40 | Surge clamp |
 | `GOAL_RADIUS` | 2.0 m | "Goal reached" threshold |
-| `SCAN_YAW` | 0.008 | Slow yaw rotation when hovering |
+| `GOAL_REACHED_TIMEOUT` | 10.0 s | Clear stale goal and enter scan if no new goal arrives |
+| `SCAN_YAW` | 0.08 | Rotation speed during scan (Change 17, restored from 0.008) |
 | `OBSTACLE_SLOW_DIST` | 2.5 m | Start reducing surge below this |
 | `OBSTACLE_STOP_DIST` | 0.8 m | Cut surge to zero below this |
+| `ESCAPE_YAW` | 0.40 | Spin rate when BLOCKED or position-stuck (Change 18) |
+| `ESCAPE_DURATION` | 4.0 s | How long to spin after CTRL_STUCK trigger (Change 18) |
+| `STUCK_SURGE_MIN` | 0.15 | Min surge to activate stuck detection (Change 18) |
+| `STUCK_WINDOW` | 5.0 s | Stuck detection window (Change 18) |
+| `STUCK_MOVE_MIN` | 0.25 m | Min movement expected in STUCK_WINDOW (Change 18) |
 | `CTRL_HZ` | 10.0 Hz | Control loop rate |
 
 ---
@@ -388,6 +512,11 @@ Raw logs go in `logs/`. From Change 11 onward, CSV files are generated automatic
 | File | Date | Summary |
 |---|---|---|
 | `2026-05-19_13-46-59_session1_raw.log` | 2026-05-19 | Pre-CSV manual log. 3 stuck detections. Loop established between (14.7,2.2) and (10,9). Z drift 8.5→13.8m. |
+| `2026-05-19_14-51-54_*.csv` | 2026-05-19 | First CSV session. Depth hold confirmed working (z drift 0.13m over 82s). Frontiers depleted after 12s, robot froze at GOAL_REACHED for 63s. |
+| `2026-05-19_15-05-00_*.csv` | 2026-05-19 | Goal timeout (Ch15) fired correctly. Coverage metrics (Ch16) working. Robot reached (14.44,−4.06), SCAN mode entered but SCAN_YAW=0.008 too slow to reorient. 9756 mapped cells. |
+| `2026-05-19_15-22-50_*.csv` | 2026-05-19 | Session 4. BLOCKED at (6.04,−0.05) with obs=0.20m from t=+6s to end (80+ seconds frozen). yaw_cmd=0.00 throughout — aligned BLOCKED with no escape. |
+| `2026-05-19_15-40-14_*.csv` | 2026-05-19 | Session 5. BLOCKED at (5.70, 0.56) obs=0.25m for 60+ seconds, then BLOCKED again at (13.88,−0.31). Same aligned-BLOCKED pattern; change 18 not yet applied. |
+| `2026-05-19_15-43-04_*.csv` | 2026-05-19 | Session 6. Two failure modes: (1) brief BLOCKED at (5.7,0) cleared by goal change, (2) physical stuck at (9.88,−1.71) for 35+ seconds with obs=2.4m — off-axis wall not in camera FOV. Root cause of Ch18. |
 
 ---
 
@@ -424,3 +553,39 @@ at publish time (frontier_extractor), but robot drifts down between updates (2s 
 The small positive heave commands (+0.00 to +0.06) are insufficient to counteract
 persistent downward drift — possibly buoyancy simulation or integration error.
 Not critical for current testing but will become a problem in deeper environments.
+**→ Fixed by Changes 12 + 14. Session 2 confirmed: drift reduced to 0.13m over 82s.**
+
+---
+
+## Session 2 — Findings (2026-05-19)
+
+**Duration**: 82s  
+**Files**: `logs/2026-05-19_14-51-54_*.csv`
+
+### What worked
+- **Depth hold** ✅: z stayed in [8.12, 8.25]m (±0.07m around setpoint 8.14m). Changes 12+14 confirmed.
+- **Navigation** ✅: Robot reached (13.74, -3.58) from origin cleanly in ~18s, no collisions.
+- **Obstacle avoidance** ✅: Brief 2s BLOCKED at wall, then cleared without collision.
+
+### Issues observed
+
+**1. Exploration terminated after 12 seconds (critical)**  
+Frontier count collapsed 7→4→3→3→1→0 as the robot moved forward. The last cluster
+(13.98,-4.20) disappeared once the robot navigated past the obstacle and the map updated.
+After t=726 the extractor found zero clusters and returned early on every tick, publishing
+no new goals. The controller reached the stale goal at t=734 and entered GOAL_REACHED.
+The robot then hovered frozen for 63 seconds with no recovery.
+
+Root cause: when frontiers run dry, the controller holds the last received goal forever.
+GOAL_REACHED state spins at `SCAN_YAW=0.008` but never clears `_goal`, so it never
+enters true SCAN mode. The extractor, finding no clusters, stays silent.
+
+**→ Fixed by Change 15 (goal timeout).**
+
+**2. Why did frontiers run dry so fast?**  
+Clusters shrank 7→1 in 11s. Likely the 2D OctoMap only surfaces frontiers within
+sensor range; as the robot mapped the near field, small residual patches dropped below
+`MIN_CLUSTER_CELLS=5` and disappeared. In open water (obs=inf from t=747) there is
+genuinely no structure ahead to generate new unknown cells.
+The robot needs to rotate and move to discover new frontiers — which Change 15 enables.
+If scanning also fails to find frontiers, `MIN_CLUSTER_CELLS` may need lowering.
