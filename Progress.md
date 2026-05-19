@@ -290,7 +290,9 @@ so each cycle the controller accepted the drifted depth as the new target.
 - `KP_HEAVE` bumped from 0.30 → 0.40 to give a bit more authority against any
   persistent buoyancy bias.
 
-**Observed impact**: 🔲 Not yet tested.
+**Observed impact**: ❌ Sign inverted — robot sank rapidly. `KP_HEAVE * (pose.z - setpoint)`
+gives **positive** heave when robot is too deep, but positive = DOWN in Stonefish.
+The robot fell faster than without any depth control. Fixed in Change 14.
 
 ---
 
@@ -321,6 +323,32 @@ Same constants, same control law, same selection rules. Identical CSV schemas
 
 **Observed impact**: 🔲 Not yet tested. Equivalent behaviour expected; regression risk
 limited to the goal-selection plumbing in `GoalManager.select()`.
+
+---
+
+## Change 14 — Fix heave sign (Stonefish convention: negative = UP)
+
+**Date**: 2026-05-19  
+**Files**: `waypoint_controller.py`
+
+**Objective**: Change 12 introduced `heave = KP_HEAVE * (pose.z - setpoint)`. In NED,
+`pose.z - setpoint > 0` when the robot is too deep — the correct response is upward
+thrust. In the Stonefish simulation **negative heave drives upward thrust**, so the
+formula produced strong downward thrust, accelerating the sink.
+
+**Fix**: Negate the error term:
+```python
+# Before (wrong — positive when deep = pushes DOWN):
+return float(np.clip(self.KP_HEAVE * depth_err, -1.0, 1.0))
+
+# After (correct — negative when deep = pushes UP in Stonefish):
+return float(np.clip(-self.KP_HEAVE * depth_err, -1.0, 1.0))
+```
+
+The docstring is updated to state "Negative output = upward thrust in Stonefish" to
+prevent future sign confusion.
+
+**Observed impact**: 🔲 Not yet tested.
 
 ---
 

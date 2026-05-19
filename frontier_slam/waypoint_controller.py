@@ -108,11 +108,11 @@ class WaypointController(Node):
     # ------------------------------------------------------------------
     # Control primitives
     def _heave_cmd(self) -> float:
-        """Hold the depth setpoint. Positive output = upward thrust (NED)."""
+        """Hold the depth setpoint. Negative output = upward thrust in Stonefish."""
         if self._depth_setpoint is None:
             return 0.0
         depth_err = self._pose[2] - self._depth_setpoint    # +ve = too deep
-        return float(np.clip(self.KP_HEAVE * depth_err, -1.0, 1.0))
+        return float(np.clip(-self.KP_HEAVE * depth_err, -1.0, 1.0))
 
     def _obstacle_factor(self) -> float:
         """0.0 (blocked) → 1.0 (clear). Linear ramp between STOP and SLOW distances."""
