@@ -1,9 +1,11 @@
 """Stateful goal selection from frontier clusters.
 
-Wraps three concerns that all act on the same committed goal:
-  - nearest-frontier selection with hysteresis (don't flip-flop between equidistant goals)
-  - stuck detection (abandon goals the robot can't approach)
-  - timed blacklist (don't immediately re-pick an abandoned goal)
+Goal commitment model — a goal changes only in two cases:
+  1. Arrived   — robot is within goal_radius of the committed position.
+  2. Stuck     — no progress toward the goal for stuck_timeout seconds.
+
+Score (distance / cluster_size) is used only when picking a NEW goal, never
+to preempt a currently committed one.
 """
 from dataclasses import dataclass
 
@@ -24,21 +26,29 @@ class GoalSelection:
 class GoalManager:
     def __init__(self, *,
                  min_explore_dist: float = 3.0,
-                 switch_hysteresis: float = 3.0,
                  goal_vanish_dist: float = 3.0,
-                 stuck_timeout: float = 15.0,
+                 goal_radius: float = 2.0,
+                 stuck_timeout: float = 30.0,
                  stuck_min_progress: float = 0.5,
-                 blacklist_duration: float = 30.0):
-        self.min_explore_dist  = min_explore_dist
-        self.switch_hysteresis = switch_hysteresis
-        self.goal_vanish_dist  = goal_vanish_dist
-        self.stuck_timeout     = stuck_timeout
-        self.stuck_min_progress = stuck_min_progress
-        self.blacklist_duration = blacklist_duration
+                 blacklist_duration: float = 60.0,
+                 arrival_blacklist_duration: float = 20.0):
+        self.min_explore_dist           = min_explore_dist
+        self.goal_vanish_dist           = goal_vanish_dist
+        self.goal_radius                = goal_radius
+        self.stuck_timeout              = stuck_timeout
+        self.stuck_min_progress         = stuck_min_progress
+        self.blacklist_duration         = blacklist_duration
+        self.arrival_blacklist_duration = arrival_blacklist_duration
 
         self._committed: np.ndarray | None = None
         self._committed_time: float = 0.0
-        self._committed_dist: float = float('inf')
+        # Sliding-window stuck detection: resets when robot gets closer to goal OR
+        # when robot has physically moved (displacement ≥ stuck_min_progress from
+        # last-reset position).  The displacement check prevents false STUCK during
+        # large A* detour arcs where goal-distance temporarily increases.
+        self._closest_dist: float = float('inf')
+        self._closest_t: float = 0.0
+        self._closest_ref_pos: np.ndarray | None = None
         self._blacklist: list = []   # [(wx, wy, expiry_time)]
 
     # ---- queries
@@ -57,9 +67,9 @@ class GoalManager:
     def select(self, clusters, robot_xy: np.ndarray, now: float):
         """Pick the next goal from the cluster list.
 
-        Returns None when there are candidates but they're all within MIN_EXPLORE_DIST
-        (the robot is already "at" every frontier). Returns a GoalSelection with
-        event='ALL_BLACKLISTED' when every remaining candidate is blacklisted.
+        Returns None when all candidates are within MIN_EXPLORE_DIST.
+        Returns a GoalSelection with event='ALL_BLACKLISTED' when every
+        remaining candidate is blacklisted.
         """
         candidates = [c for c in clusters if c.distance >= self.min_explore_dist]
         if not candidates:
@@ -70,8 +80,6 @@ class GoalManager:
             return GoalSelection(float('nan'), float('nan'), 0, 'ALL_BLACKLISTED')
 
         # Score = distance / size: prefer large clusters and close ones equally.
-        # This breaks ties between equidistant clusters in favour of the more
-        # information-rich one, and naturally deprioritises tiny noise patches.
         candidates.sort(key=lambda c: c.distance / c.size)
 
         stuck_info = self._check_and_blacklist_if_stuck(candidates, robot_xy, now)
@@ -81,8 +89,9 @@ class GoalManager:
             if not candidates:
                 return GoalSelection(float('nan'), float('nan'), 0, event, stuck_info)
 
-        gx, gy = self._pick_with_hysteresis(candidates, robot_xy, now)
-        stuck_pct = min(100, int((now - self._committed_time) / self.stuck_timeout * 100))
+        gx, gy = self._pick_committed(candidates, robot_xy, now)
+        time_no_progress = now - self._closest_t
+        stuck_pct = min(100, int(time_no_progress / self.stuck_timeout * 100))
         return GoalSelection(gx, gy, stuck_pct, event, stuck_info)
 
     # ---- internals
@@ -91,49 +100,69 @@ class GoalManager:
             return None
         cur_dist = np.hypot(self._committed[0] - robot_xy[0],
                             self._committed[1] - robot_xy[1])
-        elapsed  = now - self._committed_time
-        progress = self._committed_dist - cur_dist
-        if elapsed <= self.stuck_timeout or progress >= self.stuck_min_progress:
+
+        # Update sliding window: reset when robot gets closer to goal …
+        if cur_dist < self._closest_dist - self.stuck_min_progress:
+            self._closest_dist    = cur_dist
+            self._closest_t       = now
+            self._closest_ref_pos = robot_xy.copy()
+        # … or when robot has physically moved (catches A* detour arcs where
+        # goal-distance temporarily increases while navigating around obstacles).
+        elif (self._closest_ref_pos is not None and
+              np.hypot(robot_xy[0] - self._closest_ref_pos[0],
+                       robot_xy[1] - self._closest_ref_pos[1])
+              >= self.stuck_min_progress):
+            self._closest_t       = now
+            self._closest_ref_pos = robot_xy.copy()
+
+        if now - self._closest_t < self.stuck_timeout:
             return None
 
+        elapsed = now - self._committed_time
         info = (float(self._committed[0]), float(self._committed[1]),
-                float(elapsed), float(progress))
+                float(elapsed), float(self._closest_dist))
         self._blacklist.append((self._committed[0], self._committed[1],
                                 now + self.blacklist_duration))
         self._committed = None
         return info
 
-    def _pick_with_hysteresis(self, candidates, robot_xy, now):
-        best = candidates[0]   # best-scored: smallest distance/size
+    def _pick_committed(self, candidates, robot_xy, now):
+        """Return the goal to send.  Never switches away from a committed goal
+        except on arrival — STUCK is the only other exit, handled upstream."""
+        best = candidates[0]   # best-scored: used only when picking a fresh goal
+
         if self._committed is None:
             self._commit(best.wx, best.wy, robot_xy, now)
             return best.wx, best.wy
 
-        # Has the committed goal moved with the map? Find candidates near it.
+        # Track map-drift of the committed cluster.
         near_old = [c for c in candidates
                     if np.hypot(c.wx - self._committed[0], c.wy - self._committed[1])
                     < self.goal_vanish_dist]
-        if not near_old:
-            # The committed goal vanished — pick the best-scored fresh candidate.
+        if near_old:
+            drift = min(near_old, key=lambda c: np.hypot(c.wx - self._committed[0],
+                                                         c.wy - self._committed[1]))
+            self._committed = np.array([drift.wx, drift.wy])
+            return drift.wx, drift.wy
+
+        # Cluster vanished — check whether the robot has arrived.
+        cur_dist = np.hypot(robot_xy[0] - self._committed[0],
+                            robot_xy[1] - self._committed[1])
+        if cur_dist <= self.goal_radius:
+            # Arrived. Blacklist briefly so the robot doesn't immediately re-pick it.
+            self._blacklist.append((self._committed[0], self._committed[1],
+                                    now + self.arrival_blacklist_duration))
             self._commit(best.wx, best.wy, robot_xy, now)
             return best.wx, best.wy
 
-        # The committed goal is still around. Only switch if the best-scored candidate
-        # is also clearly closer (by distance) than where we already are — prevents
-        # abandoning a large-cluster goal mid-journey for a small nearby distraction.
-        committed_dist = np.hypot(self._committed[0] - robot_xy[0],
-                                  self._committed[1] - robot_xy[1])
-        if best.distance < committed_dist - self.switch_hysteresis:
-            self._commit(best.wx, best.wy, robot_xy, now)
-            return best.wx, best.wy
-
-        # Otherwise track drift of the committed goal without resetting the stuck timer.
-        drift = min(near_old, key=lambda c: np.hypot(c.wx - self._committed[0],
-                                                     c.wy - self._committed[1]))
-        self._committed = np.array([drift.wx, drift.wy])
-        return drift.wx, drift.wy
+        # Cluster gone but robot hasn't arrived yet — keep heading to the last
+        # known position.  STUCK will fire if progress stalls.
+        return float(self._committed[0]), float(self._committed[1])
 
     def _commit(self, gx: float, gy: float, robot_xy: np.ndarray, now: float) -> None:
-        self._committed = np.array([gx, gy])
-        self._committed_time = now
-        self._committed_dist = float(np.hypot(gx - robot_xy[0], gy - robot_xy[1]))
+        self._committed       = np.array([gx, gy])
+        self._committed_time  = now
+        d = float(np.hypot(gx - robot_xy[0], gy - robot_xy[1]))
+        self._closest_dist    = d
+        self._closest_t       = now
+        self._closest_ref_pos = robot_xy.copy()

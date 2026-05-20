@@ -12,19 +12,24 @@ The goal's Z is set to the robot's current Z — but only for marker placement.
 The waypoint controller maintains its own fixed depth setpoint and ignores
 goal.point.z.
 """
+import math
 import os
 
 import numpy as np
 import rclpy
 from rclpy.node import Node
 from builtin_interfaces.msg import Duration
-from geometry_msgs.msg import PointStamped
-from nav_msgs.msg import OccupancyGrid, Odometry
+from geometry_msgs.msg import Point, PointStamped, PoseStamped
+from nav_msgs.msg import OccupancyGrid, Odometry, Path
+from sensor_msgs.msg import Image
 from std_msgs.msg import ColorRGBA
 from visualization_msgs.msg import Marker, MarkerArray
 
+from frontier_slam.control_utils import yaw_from_quat
 from frontier_slam.frontier_detection import find_frontier_clusters
 from frontier_slam.goal_manager import GoalManager
+from frontier_slam.path_planner import (HARD_INFLATION_M, INFLATION_M, PLAN_INFLATION_M,
+                                         inflate_occupied, plan_path)
 from frontier_slam.session_log import open_session_log
 
 
@@ -49,14 +54,23 @@ class FrontierExtractor(Node):
 
         self._map: OccupancyGrid | None = None
         self._robot_pos: np.ndarray | None = None
+        self._current_goal_xy: np.ndarray | None = None
+        self._current_path: list = []
+        self._inflated_grid: np.ndarray | None = None
+        self._hard_inflated_grid: np.ndarray | None = None
+        self._plan_inflated_grid: np.ndarray | None = None
+        self._robot_yaw: float = 0.0
+        self._robot_speed: float = 0.0
+        self._last_stuck_pct: int = 0
 
         self._goals = GoalManager(
             min_explore_dist=3.0,
-            switch_hysteresis=3.0,
             goal_vanish_dist=3.0,
-            stuck_timeout=15.0,
+            goal_radius=2.0,
+            stuck_timeout=30.0,
             stuck_min_progress=0.5,
             blacklist_duration=30.0,
+            arrival_blacklist_duration=20.0,
         )
 
         self._log = open_session_log('extractor', CSV_COLUMNS, _LOG_DIR)
@@ -64,9 +78,13 @@ class FrontierExtractor(Node):
         self.create_subscription(OccupancyGrid, '/projected_map',     self._map_cb,  1)
         self.create_subscription(Odometry,      '/StoneFish/Odometry', self._odom_cb, 10)
         self._goal_pub = self.create_publisher(PointStamped, '/frontier_slam/goal',      1)
-        self._viz_pub  = self.create_publisher(MarkerArray,  '/frontier_slam/frontiers', 1)
+        self._path_pub = self.create_publisher(Path,         '/frontier_slam/path',      1)
+        self._viz_pub          = self.create_publisher(MarkerArray,   '/frontier_slam/frontiers',    1)
+        self._inflated_map_pub = self.create_publisher(OccupancyGrid, '/frontier_slam/inflated_map', 1)
+        self._debug_img_pub    = self.create_publisher(Image,         '/frontier_slam/debug_image',  1)
 
         self.create_timer(1.0 / self.UPDATE_HZ, self._update)
+        self.create_timer(1.0, self._replan)
         self.get_logger().info(f'frontier_extractor ready — logging to {self._log.path}')
 
     # ------------------------------------------------------------------
@@ -76,7 +94,10 @@ class FrontierExtractor(Node):
 
     def _odom_cb(self, msg: Odometry) -> None:
         p = msg.pose.pose.position
-        self._robot_pos = np.array([p.x, p.y, p.z])
+        self._robot_pos   = np.array([p.x, p.y, p.z])
+        self._robot_yaw   = yaw_from_quat(msg.pose.pose.orientation)
+        v = msg.twist.twist.linear
+        self._robot_speed = math.hypot(v.x, v.y)
 
     def _now(self) -> float:
         return self.get_clock().now().nanoseconds * 1e-9
@@ -125,15 +146,18 @@ class FrontierExtractor(Node):
                 f'(progress={prog:.2f}m) — blacklisting'
             )
 
-        if selection.event == 'ALL_BLACKLISTED':
+        if selection.event == 'ALL_BLACKLISTED' or math.isnan(selection.gx):
             self.get_logger().info(
                 'All candidates blacklisted — waiting', throttle_duration_sec=5.0,
             )
+            self._current_goal_xy = None
+            self._current_path    = []
             self._write_csv(float('nan'), float('nan'), float('nan'),
                             len(clusters), 0,
-                            free_cells, occ_cells, mapped_cells, 'ALL_BLACKLISTED')
+                            free_cells, occ_cells, mapped_cells, selection.event or 'ALL_BLACKLISTED')
             return
 
+        self._last_stuck_pct = selection.stuck_pct
         self._publish_goal(selection.gx, selection.gy, clusters)
         dist = float(np.hypot(selection.gx - self._robot_pos[0],
                               selection.gy - self._robot_pos[1]))
@@ -151,6 +175,7 @@ class FrontierExtractor(Node):
     # ------------------------------------------------------------------
     # Publishing
     def _publish_goal(self, gx: float, gy: float, clusters: list) -> None:
+        self._current_goal_xy = np.array([gx, gy])
         gz = float(self._robot_pos[2])   # only used for marker placement
         goal = PointStamped()
         goal.header.stamp    = self.get_clock().now().to_msg()
@@ -158,6 +183,45 @@ class FrontierExtractor(Node):
         goal.point.x, goal.point.y, goal.point.z = gx, gy, gz
         self._goal_pub.publish(goal)
         self._publish_viz(clusters, gx, gy, gz)
+
+    def _replan(self) -> None:
+        if self._map is None or self._robot_pos is None:
+            return
+
+        # Keep inflated grids in sync so visualisation always reflects what A* sees.
+        info        = self._map.info
+        raw         = np.asarray(self._map.data, dtype=np.int8).reshape(info.height, info.width)
+        soft_radius = max(1, int(round(INFLATION_M      / info.resolution)))
+        hard_radius = max(1, int(round(HARD_INFLATION_M / info.resolution)))
+        plan_radius = max(1, int(round(PLAN_INFLATION_M / info.resolution)))
+        self._inflated_grid      = inflate_occupied(raw, soft_radius)
+        self._hard_inflated_grid = inflate_occupied(raw, hard_radius)
+        self._plan_inflated_grid = inflate_occupied(raw, plan_radius)
+
+        path = Path()
+        path.header.stamp    = self.get_clock().now().to_msg()
+        path.header.frame_id = 'world_ned'
+        if self._current_goal_xy is not None and not np.any(np.isnan(self._current_goal_xy)):
+            waypoints = plan_path(self._map, self._robot_pos[:2], self._current_goal_xy)
+            self._current_path = waypoints
+            gz = float(self._robot_pos[2])
+            for wx, wy in waypoints:
+                ps = PoseStamped()
+                ps.header = path.header
+                ps.pose.position.x = wx
+                ps.pose.position.y = wy
+                ps.pose.position.z = gz
+                ps.pose.orientation.w = 1.0
+                path.poses.append(ps)
+            if not waypoints:
+                self.get_logger().warn(
+                    f'A* found no path to '
+                    f'({self._current_goal_xy[0]:.1f},{self._current_goal_xy[1]:.1f})',
+                    throttle_duration_sec=5.0,
+                )
+        self._path_pub.publish(path)
+        self._publish_inflated_map()
+        self._publish_debug_image()
 
     def _publish_viz(self, clusters: list, gx: float, gy: float, gz: float) -> None:
         markers = MarkerArray()
@@ -175,6 +239,29 @@ class FrontierExtractor(Node):
             scale=0.8, rgba=(1.0, 0.0, 0.0, 0.9),
             stamp=now, lifetime=lifetime,
         ))
+        # Arrow pointing at the goal — tail is 2 m behind the goal along the approach vector,
+        # head is at the goal itself, showing the heading the robot needs to hold.
+        dx, dy = gx - self._robot_pos[0], gy - self._robot_pos[1]
+        dist = math.hypot(dx, dy)
+        if dist > 0.5:
+            arrow_len = min(2.0, dist * 0.8)
+            ux, uy = dx / dist, dy / dist
+            arrow = Marker()
+            arrow.header.stamp    = now
+            arrow.header.frame_id = 'world_ned'
+            arrow.ns      = 'goal_arrow'
+            arrow.id      = 0
+            arrow.type    = Marker.ARROW
+            arrow.action  = Marker.ADD
+            arrow.points  = [
+                Point(x=gx - ux * arrow_len, y=gy - uy * arrow_len, z=gz),
+                Point(x=gx, y=gy, z=gz),
+            ]
+            arrow.scale.x = 0.15   # shaft diameter
+            arrow.scale.y = 0.35   # head diameter
+            arrow.color   = ColorRGBA(r=1.0, g=0.5, b=0.0, a=0.9)
+            arrow.lifetime = lifetime
+            markers.markers.append(arrow)
         self._viz_pub.publish(markers)
 
     @staticmethod
@@ -192,6 +279,124 @@ class FrontierExtractor(Node):
         m.color = ColorRGBA(r=rgba[0], g=rgba[1], b=rgba[2], a=rgba[3])
         m.lifetime = lifetime
         return m
+
+    # ------------------------------------------------------------------
+    # Debug visualisation
+    def _publish_inflated_map(self) -> None:
+        if self._map is None or self._inflated_grid is None:
+            return
+        info = self._map.info
+        raw  = np.asarray(self._map.data, dtype=np.int8).reshape(info.height, info.width)
+        out  = raw.copy()
+        if self._plan_inflated_grid is not None:
+            out[(self._plan_inflated_grid == 100) & (raw != 100)] = 35  # planning zone → 35
+        out[(self._inflated_grid == 100) & (raw != 100)] = 50           # soft zone → 50
+        if self._hard_inflated_grid is not None:
+            out[(self._hard_inflated_grid == 100) & (raw != 100)] = 75  # hard zone → 75
+        msg = OccupancyGrid()
+        msg.header.stamp    = self.get_clock().now().to_msg()
+        msg.header.frame_id = 'world_ned'
+        msg.info            = self._map.info
+        msg.data            = out.flatten().tolist()
+        self._inflated_map_pub.publish(msg)
+
+    @staticmethod
+    def _draw_line(img: np.ndarray, r0: int, c0: int, r1: int, c1: int,
+                   color: tuple) -> None:
+        """Draw a 1-pixel line by interpolation (no external deps)."""
+        n = max(abs(r1 - r0), abs(c1 - c0), 1)
+        rs = np.round(np.linspace(r0, r1, n)).astype(int)
+        cs = np.round(np.linspace(c0, c1, n)).astype(int)
+        h, w = img.shape[:2]
+        ok = (rs >= 0) & (rs < h) & (cs >= 0) & (cs < w)
+        img[rs[ok], cs[ok]] = color
+
+    def _robot_arrow_color(self) -> tuple:
+        if self._current_goal_xy is None:
+            return (0, 200, 200)   # cyan  = scanning / no valid goal
+        if self._last_stuck_pct >= 100:
+            return (220, 100, 0)   # orange = maxed stuck
+        if self._last_stuck_pct >= 50:
+            return (220, 220, 0)   # yellow = approaching stuck timeout
+        return (50, 150, 255)      # blue  = navigating normally
+
+    def _publish_debug_image(self) -> None:
+        if self._map is None or self._robot_pos is None:
+            return
+        info = self._map.info
+        h, w = info.height, info.width
+        res  = info.resolution
+        ox   = info.origin.position.x
+        oy   = info.origin.position.y
+
+        raw = np.asarray(self._map.data, dtype=np.int8).reshape(h, w)
+        img = np.zeros((h, w, 3), dtype=np.uint8)
+        img[raw == -1] = (80,  80,  80)   # unknown
+        img[raw == 0]  = (210, 210, 210)  # free
+        img[raw == 100]= (20,  20,  20)   # occupied
+
+        if self._plan_inflated_grid is not None:
+            img[(self._plan_inflated_grid == 100) & (raw != 100)] = (180, 160, 60)   # planning zone
+        if self._inflated_grid is not None:
+            img[(self._inflated_grid == 100) & (raw != 100)] = (200, 100, 50)        # soft zone
+        if self._hard_inflated_grid is not None:
+            img[(self._hard_inflated_grid == 100) & (raw != 100)] = (150, 30, 30)    # hard zone
+
+        # Path as connected line segments (green)
+        if self._current_path:
+            pts = [(int((wy - oy) / res), int((wx - ox) / res))
+                   for wx, wy in self._current_path]
+            for i in range(len(pts) - 1):
+                self._draw_line(img, pts[i][0], pts[i][1],
+                                pts[i + 1][0], pts[i + 1][1], (0, 220, 0))
+
+        # Goal: red cross
+        if self._current_goal_xy is not None:
+            gc = int((self._current_goal_xy[0] - ox) / res)
+            gr = int((self._current_goal_xy[1] - oy) / res)
+            if 0 <= gr < h and 0 <= gc < w:
+                for d in range(-4, 5):
+                    if 0 <= gr + d < h: img[gr + d, gc] = (220, 50, 50)
+                    if 0 <= gc + d < w: img[gr, gc + d] = (220, 50, 50)
+
+        # Robot: arrow aligned to heading, length ∝ speed
+        # Pre-flip coords: col↔X(North/right), row↔Y(East/down-before-flip→up-after)
+        # dc=cos(yaw), dr=sin(yaw) maps correctly after flipud.
+        rc = int((self._robot_pos[0] - ox) / res)
+        rr = int((self._robot_pos[1] - oy) / res)
+        arm = max(4, int(4 + self._robot_speed * 20))   # pixels; ~10px at MAX_SURGE
+        dc  = int(round(math.cos(self._robot_yaw) * arm))
+        dr  = int(round(math.sin(self._robot_yaw) * arm))
+        color = self._robot_arrow_color()
+        if 0 <= rr < h and 0 <= rc < w:
+            self._draw_line(img, rr, rc, rr + dr, rc + dc, color)
+            # 3×3 body dot at tail
+            img[max(0, rr - 1):min(h, rr + 2), max(0, rc - 1):min(w, rc + 2)] = color
+            # 3×3 arrowhead dot at tip
+            tr, tc = rr + dr, rc + dc
+            if 0 <= tr < h and 0 <= tc < w:
+                img[max(0, tr - 1):min(h, tr + 2), max(0, tc - 1):min(w, tc + 2)] = color
+
+        # Flip vertical axis (OccupancyGrid row-0 = south, image row-0 = top)
+        out = np.flipud(img)
+
+        # 4-pixel status bar at top — colour encodes robot state
+        bar = ((0, 150, 150) if self._current_goal_xy is None else
+               (200, 80,  0) if self._last_stuck_pct >= 100      else
+               (200, 200, 0) if self._last_stuck_pct >= 50       else
+               (0,  120,  0))
+        out[0:4, :] = bar
+
+        msg = Image()
+        msg.header.stamp    = self.get_clock().now().to_msg()
+        msg.header.frame_id = 'world_ned'
+        msg.height          = h
+        msg.width           = w
+        msg.encoding        = 'rgb8'
+        msg.is_bigendian    = False
+        msg.step            = w * 3
+        msg.data            = out.tobytes()
+        self._debug_img_pub.publish(msg)
 
     # ------------------------------------------------------------------
     # Logging
