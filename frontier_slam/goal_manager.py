@@ -159,6 +159,18 @@ class GoalManager:
         # known position.  STUCK will fire if progress stalls.
         return float(self._committed[0]), float(self._committed[1])
 
+    def mark_unreachable(self, goal_xy: np.ndarray, now: float) -> None:
+        """Blacklist a goal that A* consistently cannot path-plan to."""
+        wx, wy = float(goal_xy[0]), float(goal_xy[1])
+        self._blacklist.append((wx, wy, now + self.blacklist_duration))
+        if (self._committed is not None and
+                np.hypot(self._committed[0] - wx, self._committed[1] - wy)
+                < self.goal_vanish_dist):
+            self._committed       = None
+            self._closest_dist    = float('inf')
+            self._closest_t       = 0.0
+            self._closest_ref_pos = None
+
     def _commit(self, gx: float, gy: float, robot_xy: np.ndarray, now: float) -> None:
         self._committed       = np.array([gx, gy])
         self._committed_time  = now

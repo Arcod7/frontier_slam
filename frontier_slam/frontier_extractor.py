@@ -48,6 +48,8 @@ CSV_COLUMNS = [
 class FrontierExtractor(Node):
     MIN_CLUSTER_CELLS = 5
     UPDATE_HZ         = 0.5
+    REPLAN_HZ         = 3.0
+    REPLAN_FAIL_MAX   = 6    # consecutive A* failures before blacklisting goal as unreachable
 
     def __init__(self):
         super().__init__('frontier_extractor')
@@ -62,6 +64,8 @@ class FrontierExtractor(Node):
         self._robot_yaw: float = 0.0
         self._robot_speed: float = 0.0
         self._last_stuck_pct: int = 0
+        self._astar_fail_count: int = 0
+        self._astar_fail_goal: np.ndarray | None = None
 
         self._goals = GoalManager(
             min_explore_dist=3.0,
@@ -83,8 +87,8 @@ class FrontierExtractor(Node):
         self._inflated_map_pub = self.create_publisher(OccupancyGrid, '/frontier_slam/inflated_map', 1)
         self._debug_img_pub    = self.create_publisher(Image,         '/frontier_slam/debug_image',  1)
 
-        self.create_timer(1.0 / self.UPDATE_HZ, self._update)
-        self.create_timer(1.0, self._replan)
+        self.create_timer(1.0 / self.UPDATE_HZ,  self._update)
+        self.create_timer(1.0 / self.REPLAN_HZ,  self._replan)
         self.get_logger().info(f'frontier_extractor ready — logging to {self._log.path}')
 
     # ------------------------------------------------------------------
@@ -202,23 +206,45 @@ class FrontierExtractor(Node):
         path.header.stamp    = self.get_clock().now().to_msg()
         path.header.frame_id = 'world_ned'
         if self._current_goal_xy is not None and not np.any(np.isnan(self._current_goal_xy)):
+            # Reset failure counter when the goal changes.
+            if (self._astar_fail_goal is None or
+                    np.hypot(self._current_goal_xy[0] - self._astar_fail_goal[0],
+                             self._current_goal_xy[1] - self._astar_fail_goal[1]) > 1.0):
+                self._astar_fail_count = 0
+                self._astar_fail_goal  = self._current_goal_xy.copy()
+
             waypoints = plan_path(self._map, self._robot_pos[:2], self._current_goal_xy)
             self._current_path = waypoints
-            gz = float(self._robot_pos[2])
-            for wx, wy in waypoints:
-                ps = PoseStamped()
-                ps.header = path.header
-                ps.pose.position.x = wx
-                ps.pose.position.y = wy
-                ps.pose.position.z = gz
-                ps.pose.orientation.w = 1.0
-                path.poses.append(ps)
-            if not waypoints:
-                self.get_logger().warn(
-                    f'A* found no path to '
-                    f'({self._current_goal_xy[0]:.1f},{self._current_goal_xy[1]:.1f})',
-                    throttle_duration_sec=5.0,
-                )
+
+            if waypoints:
+                self._astar_fail_count = 0
+                gz = float(self._robot_pos[2])
+                for wx, wy in waypoints:
+                    ps = PoseStamped()
+                    ps.header = path.header
+                    ps.pose.position.x = wx
+                    ps.pose.position.y = wy
+                    ps.pose.position.z = gz
+                    ps.pose.orientation.w = 1.0
+                    path.poses.append(ps)
+            else:
+                self._astar_fail_count += 1
+                gxy = self._current_goal_xy
+                if self._astar_fail_count >= self.REPLAN_FAIL_MAX:
+                    self.get_logger().warn(
+                        f'A* failed {self.REPLAN_FAIL_MAX}× for '
+                        f'({gxy[0]:.1f},{gxy[1]:.1f}) — blacklisting as unreachable'
+                    )
+                    self._goals.mark_unreachable(gxy, self._now())
+                    self._current_goal_xy  = None
+                    self._current_path     = []
+                    self._astar_fail_count = 0
+                    self._astar_fail_goal  = None
+                else:
+                    self.get_logger().warn(
+                        f'A* found no path to ({gxy[0]:.1f},{gxy[1]:.1f}) '
+                        f'({self._astar_fail_count}/{self.REPLAN_FAIL_MAX})'
+                    )
         self._path_pub.publish(path)
         self._publish_inflated_map()
         self._publish_debug_image()

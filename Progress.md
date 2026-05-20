@@ -1410,6 +1410,37 @@ STUCK would never fire during active navigation.
 
 ---
 
+## Change 40 — Blacklist A*-unreachable goals after repeated planning failures
+
+**Date**: 2026-05-20  
+**Files**: `frontier_extractor.py`, `goal_manager.py`
+
+**Problem**: when A* returns no path (e.g. goal is surrounded by inflated walls, or in an isolated pocket), the controller falls back to direct heading and crashes, or the robot spins in SCAN. GoalManager never learns the goal is unreachable — it keeps re-selecting the same blacklisted-on-stuck goal after the blacklist expires, or a newly spawned equivalent cluster.
+
+**Fix**: count consecutive A* failures per goal in the extractor. After `REPLAN_FAIL_MAX` failures (= 2 s at REPLAN_HZ=3), call `GoalManager.mark_unreachable()` which:
+- Adds the position to the blacklist with `blacklist_duration` (30 s)
+- Clears `_committed` so `select()` immediately picks a different frontier
+
+The fail counter resets when the goal changes by >1m or when A* finds a path. This tolerates 1–2 transient failures (back-surge temporarily puts the start inside the inflated zone, sparse map at startup).
+
+**New state** (`frontier_extractor.py`): `_astar_fail_count`, `_astar_fail_goal`  
+**New method** (`goal_manager.py`): `mark_unreachable(goal_xy, now)`
+
+**Observed impact**: 🔲 Not yet tested.
+
+---
+
+## Change 41 — REPLAN_HZ: 1 Hz → 3 Hz + expose as class constant
+
+**Date**: 2026-05-20  
+**Files**: `frontier_extractor.py`
+
+**Objective**: the previous hardcoded `create_timer(1.0, self._replan)` gave A* replanning a 1-second cadence — slow compared to the controller's 10 Hz loop. At 0.25 m/s the robot travels 0.25m per replan cycle; at 3 Hz it travels ≈0.08m, giving the path much tighter tracking. Also exposes `REPLAN_HZ = 3.0` as a class constant (like `UPDATE_HZ`) so it is easy to find and change. `REPLAN_FAIL_MAX` adjusted from 5 to 6 (still ≈2 s at the new rate).
+
+**Observed impact**: 🔲 Not yet tested.
+
+---
+
 ## Current parameter snapshot
 
 ### frontier_extractor.py / goal_manager.py
@@ -1421,22 +1452,23 @@ STUCK would never fire during active navigation.
 | `GOAL_RADIUS` | 2.0 m | Robot "arrived" threshold — GoalManager switches when cur_dist ≤ this (Ch28) |
 | `STUCK_TIMEOUT` | 30.0 s | Abandon goal after this long with no progress (Ch37, was 15s) |
 | `STUCK_MIN_PROGRESS` | 0.5 m | Minimum distance closed to not be "stuck" |
-| `BLACKLIST_DURATION` | 30.0 s | Blacklist duration after STUCK — goal abandoned |
+| `BLACKLIST_DURATION` | 30.0 s | Blacklist duration after STUCK or A*-unreachable |
 | `ARRIVAL_BLACKLIST_DURATION` | 20.0 s | Blacklist duration after goal reached — prevents re-picking (Ch35) |
 | `UPDATE_HZ` | 0.5 Hz | Frontier re-evaluation rate |
-| `REPLAN_HZ` | 1.0 Hz | A* path replanning rate |
+| `REPLAN_HZ` | 3.0 Hz | A* path replanning rate (Ch41, was 1 Hz) |
+| `REPLAN_FAIL_MAX` | 6 | Consecutive A* failures before blacklisting goal (Ch40; ≈2 s at 3 Hz) |
 
 ### waypoint_controller.py
 | Parameter | Value | Purpose |
 |---|---|---|
 | `KP_YAW` | 0.07 | Heading P-gain |
-| `KP_SURGE` | 0.25 | Forward speed P-gain |
+| `KP_SURGE` | 0.35 | Forward speed P-gain |
 | `KP_HEAVE` | 0.40 | Depth-hold P-gain |
-| `MAX_SURGE` | 0.25 | Surge clamp (Ch32, was 0.40) |
+| `MAX_SURGE` | 0.35 | Surge clamp (Ch32) |
 | `GOAL_RADIUS` | 2.0 m | "Goal reached" threshold |
 | `GOAL_REACHED_TIMEOUT` | 10.0 s | Clear stale goal and enter scan if no new goal arrives |
 | `SCAN_YAW` | 0.08 | Rotation speed during scan / initial scan |
-| `INIT_SCAN_DURATION` | 5.0 s | Startup spin duration before navigating (Ch27, was 20s) |
+| `INIT_SCAN_DURATION` | 10.0 s | Startup spin duration before navigating |
 | `WAYPOINT_ADVANCE_DIST` | 1.5 m | Advance to next path waypoint when this close (Ch26) |
 | `OBS_SLOW_DIST` | 1.5 m | Begin linear surge ramp-down at this distance (Ch35, was 2.0m) |
 | `EMERGENCY_STOP_DIST` | 0.4 m | Below this: switch from ramp to back-surge (Ch33) |
