@@ -31,7 +31,7 @@ def find_frontier_clusters(grid_msg, min_cluster_cells: int = 5) -> list:
     grid    = np.array(grid_msg.data, dtype=np.int8).reshape(h, w)
     free    = (grid == 0)
     unknown = (grid < 0)
-    frontier = free & binary_dilation(unknown, iterations=1)
+    frontier = free & binary_dilation(unknown)
 
     labeled, n = label(frontier)
     if n == 0:

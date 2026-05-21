@@ -1406,7 +1406,7 @@ moved to (3.68,-4.70) — displacement 0.93m > 0.5m → timer resets. Then to (4
 another 0.72m → resets again. The arc covers ~6m total, resetting the timer ~12 times.
 STUCK would never fire during active navigation.
 
-**Observed impact**: 🔲 Not yet tested.
+**Observed impact**: ✅ Sessions 20+21 (`2026-05-20_15-26-54`, `2026-05-20_15-39-59`): `stuck_pct` stayed ≤40% throughout both sessions — even during the same type of southward arc (12.39m) that caused the session 18 false positive. No STUCK_BLACKLIST fired in either session (vs session 18's false positive at t≈90s). Session 21 also set the best-ever coverage record (+26,208 cells).
 
 ---
 
@@ -1438,6 +1438,43 @@ The fail counter resets when the goal changes by >1m or when A* finds a path. Th
 **Objective**: the previous hardcoded `create_timer(1.0, self._replan)` gave A* replanning a 1-second cadence — slow compared to the controller's 10 Hz loop. At 0.25 m/s the robot travels 0.25m per replan cycle; at 3 Hz it travels ≈0.08m, giving the path much tighter tracking. Also exposes `REPLAN_HZ = 3.0` as a class constant (like `UPDATE_HZ`) so it is easy to find and change. `REPLAN_FAIL_MAX` adjusted from 5 to 6 (still ≈2 s at the new rate).
 
 **Observed impact**: 🔲 Not yet tested.
+
+---
+
+## Change 42 — Code cleanup: redundant inflations, docstring fixes, side-effect removal
+
+**Date**: 2026-05-21  
+**Files**: `path_planner.py`, `frontier_extractor.py`, `frontier_detection.py`,
+`goal_manager.py`, `control_utils.py`
+
+**Objective**: No behavioural changes — quality pass to remove accumulated technical debt.
+
+**`path_planner.py`** — refactored to expose `CostGrid` dataclass + `build_cost_grid()` +
+`find_path()`. The three inflation passes and cost grid are now computed once per replan tick
+(inside `build_cost_grid`) and the result is reused by both the planner and the visualisation
+code. Eliminated the redundant triple inflation that was happening separately in `_replan` and
+`_publish_inflated_map`. Updated module docstring to "Three-zone inflation strategy".
+
+**`frontier_extractor.py`** — replaced `_inflated_grid`, `_hard_inflated_grid`,
+`_plan_inflated_grid` state attributes (and the inline inflation in `_replan`) with a single
+`self._cg: CostGrid | None`. `_publish_inflated_map` and `_publish_debug_image` now read from
+`self._cg.{soft_zone,hard_blocked,plan_zone}[PAD_CELLS:-PAD_CELLS, PAD_CELLS:-PAD_CELLS]` and
+`self._cg.raw` instead of re-parsing `self._map.data` each tick.
+
+**`frontier_detection.py`** — removed redundant `iterations=1` keyword from
+`binary_dilation(unknown, iterations=1)` (default is already 1; passing it explicitly was
+misleading noise).
+
+**`goal_manager.py`** — moved blacklist expiry pruning out of `is_blacklisted` (a query
+method that had a hidden side-effect) into `select()` (called once per cycle). `is_blacklisted`
+signature simplified to `(wx, wy)` — no longer needs `now`.
+
+**`control_utils.py`** — corrected module docstring: was "positive heave = upward in NED"
+which contradicts the actual controller formula `heave = -KP * depth_err` (negative = upward
+thrust in Stonefish). Now states "negative = upward thrust in Stonefish" consistently with
+`waypoint_controller.py`'s `_heave_cmd` docstring.
+
+**Observed impact**: 🔲 No sessions run yet (pure refactor — no algorithmic changes).
 
 ---
 
@@ -1516,6 +1553,9 @@ Raw logs go in `logs/`. From Change 11 onward, CSV files are generated automatic
 | `2026-05-20_14-32-18_*.csv` | 2026-05-20 | Session 16. STUCK_BLACKLIST fired 4× in ~2.5min. A* routing paths through soft zone → surge ramp → drift → goal-distance increase → stuck. Added 3rd planning zone (Ch37) + STUCK_TIMEOUT 15→30s. |
 | `2026-05-20_15-01-26_*.csv` | 2026-05-20 | Session 17. Rapid silent goal switch from (10.10,0.00) to (0.00,−0.36) to (2.25,8.15) within 30s. Score-based hysteresis triggered on committed-dist (shrinks as robot progresses). Removed score switching entirely (Ch38). |
 | `2026-05-20_15-16-03_*.csv` | 2026-05-20 | Session 18. Ch38 confirmed: goal held throughout. STUCK_BLACKLIST false positive at t≈90s — A* routed a southward arc, goal-distance increased 8.19→9.6m over 28s → stuck timer expired. Robot was moving at full surge with valid path. Fixed by Ch39 (displacement reset). |
+| `2026-05-20_15-18-22_*.csv` | 2026-05-20 | Session 19. Ch39 first test. 338s, +14,057 mapped cells. One legitimate STUCK_BLACKLIST at (14.33,−5.96) — max stuck_pct=93, robot genuinely stalled. No false positives. |
+| `2026-05-20_15-26-54_*.csv` | 2026-05-20 | Session 20. 222s, +20,853 mapped cells. STUCK_BLACKLIST=0, max stuck_pct=40. Ch39 confirmed: no false STUCK during southward arc (12.39m detour). |
+| `2026-05-20_15-39-59_*.csv` | 2026-05-20 | Session 21. Best session ever: 336s, +26,208 mapped cells. STUCK_BLACKLIST=0, max stuck_pct=39. Explored new northwest territory. Ch39 fully confirmed. |
 
 ---
 

@@ -28,8 +28,7 @@ from visualization_msgs.msg import Marker, MarkerArray
 from frontier_slam.control_utils import yaw_from_quat
 from frontier_slam.frontier_detection import find_frontier_clusters
 from frontier_slam.goal_manager import GoalManager
-from frontier_slam.path_planner import (HARD_INFLATION_M, INFLATION_M, PLAN_INFLATION_M,
-                                         inflate_occupied, plan_path)
+from frontier_slam.path_planner import PAD_CELLS, CostGrid, build_cost_grid, find_path
 from frontier_slam.session_log import open_session_log
 
 
@@ -58,9 +57,7 @@ class FrontierExtractor(Node):
         self._robot_pos: np.ndarray | None = None
         self._current_goal_xy: np.ndarray | None = None
         self._current_path: list = []
-        self._inflated_grid: np.ndarray | None = None
-        self._hard_inflated_grid: np.ndarray | None = None
-        self._plan_inflated_grid: np.ndarray | None = None
+        self._cg: CostGrid | None = None
         self._robot_yaw: float = 0.0
         self._robot_speed: float = 0.0
         self._last_stuck_pct: int = 0
@@ -192,15 +189,7 @@ class FrontierExtractor(Node):
         if self._map is None or self._robot_pos is None:
             return
 
-        # Keep inflated grids in sync so visualisation always reflects what A* sees.
-        info        = self._map.info
-        raw         = np.asarray(self._map.data, dtype=np.int8).reshape(info.height, info.width)
-        soft_radius = max(1, int(round(INFLATION_M      / info.resolution)))
-        hard_radius = max(1, int(round(HARD_INFLATION_M / info.resolution)))
-        plan_radius = max(1, int(round(PLAN_INFLATION_M / info.resolution)))
-        self._inflated_grid      = inflate_occupied(raw, soft_radius)
-        self._hard_inflated_grid = inflate_occupied(raw, hard_radius)
-        self._plan_inflated_grid = inflate_occupied(raw, plan_radius)
+        self._cg = build_cost_grid(self._map)
 
         path = Path()
         path.header.stamp    = self.get_clock().now().to_msg()
@@ -213,7 +202,7 @@ class FrontierExtractor(Node):
                 self._astar_fail_count = 0
                 self._astar_fail_goal  = self._current_goal_xy.copy()
 
-            waypoints = plan_path(self._map, self._robot_pos[:2], self._current_goal_xy)
+            waypoints = find_path(self._cg, self._robot_pos[:2], self._current_goal_xy)
             self._current_path = waypoints
 
             if waypoints:
@@ -309,16 +298,17 @@ class FrontierExtractor(Node):
     # ------------------------------------------------------------------
     # Debug visualisation
     def _publish_inflated_map(self) -> None:
-        if self._map is None or self._inflated_grid is None:
+        if self._map is None or self._cg is None:
             return
         info = self._map.info
-        raw  = np.asarray(self._map.data, dtype=np.int8).reshape(info.height, info.width)
-        out  = raw.copy()
-        if self._plan_inflated_grid is not None:
-            out[(self._plan_inflated_grid == 100) & (raw != 100)] = 35  # planning zone → 35
-        out[(self._inflated_grid == 100) & (raw != 100)] = 50           # soft zone → 50
-        if self._hard_inflated_grid is not None:
-            out[(self._hard_inflated_grid == 100) & (raw != 100)] = 75  # hard zone → 75
+        if self._cg.raw.shape != (info.height, info.width):
+            return
+        raw = self._cg.raw
+        out = raw.copy()
+        p   = PAD_CELLS
+        out[self._cg.plan_zone[p:-p, p:-p]    & (raw != 100)] = 35  # planning zone → 35
+        out[self._cg.soft_zone[p:-p, p:-p]    & (raw != 100)] = 50  # soft zone → 50
+        out[self._cg.hard_blocked[p:-p, p:-p] & (raw != 100)] = 75  # hard zone → 75
         msg = OccupancyGrid()
         msg.header.stamp    = self.get_clock().now().to_msg()
         msg.header.frame_id = 'world_ned'
@@ -355,18 +345,18 @@ class FrontierExtractor(Node):
         ox   = info.origin.position.x
         oy   = info.origin.position.y
 
-        raw = np.asarray(self._map.data, dtype=np.int8).reshape(h, w)
+        raw = (self._cg.raw if (self._cg is not None and self._cg.raw.shape == (h, w))
+               else np.asarray(self._map.data, dtype=np.int8).reshape(h, w))
         img = np.zeros((h, w, 3), dtype=np.uint8)
         img[raw == -1] = (80,  80,  80)   # unknown
         img[raw == 0]  = (210, 210, 210)  # free
         img[raw == 100]= (20,  20,  20)   # occupied
 
-        if self._plan_inflated_grid is not None:
-            img[(self._plan_inflated_grid == 100) & (raw != 100)] = (180, 160, 60)   # planning zone
-        if self._inflated_grid is not None:
-            img[(self._inflated_grid == 100) & (raw != 100)] = (200, 100, 50)        # soft zone
-        if self._hard_inflated_grid is not None:
-            img[(self._hard_inflated_grid == 100) & (raw != 100)] = (150, 30, 30)    # hard zone
+        if self._cg is not None and self._cg.raw.shape == (h, w):
+            p = PAD_CELLS
+            img[self._cg.plan_zone[p:-p, p:-p]    & (raw != 100)] = (180, 160, 60)  # planning zone
+            img[self._cg.soft_zone[p:-p, p:-p]    & (raw != 100)] = (200, 100, 50)  # soft zone
+            img[self._cg.hard_blocked[p:-p, p:-p] & (raw != 100)] = (150, 30,  30)  # hard zone
 
         # Path as connected line segments (green)
         if self._current_path:

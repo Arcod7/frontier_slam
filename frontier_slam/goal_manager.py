@@ -56,8 +56,7 @@ class GoalManager:
     def blacklist_size(self) -> int:
         return len(self._blacklist)
 
-    def is_blacklisted(self, wx: float, wy: float, now: float) -> bool:
-        self._blacklist = [(x, y, t) for x, y, t in self._blacklist if t > now]
+    def is_blacklisted(self, wx: float, wy: float) -> bool:
         return any(
             np.hypot(wx - x, wy - y) < self.goal_vanish_dist
             for x, y, _ in self._blacklist
@@ -71,11 +70,13 @@ class GoalManager:
         Returns a GoalSelection with event='ALL_BLACKLISTED' when every
         remaining candidate is blacklisted.
         """
+        self._blacklist = [(x, y, t) for x, y, t in self._blacklist if t > now]
+
         candidates = [c for c in clusters if c.distance >= self.min_explore_dist]
         if not candidates:
             return None
 
-        candidates = [c for c in candidates if not self.is_blacklisted(c.wx, c.wy, now)]
+        candidates = [c for c in candidates if not self.is_blacklisted(c.wx, c.wy)]
         if not candidates:
             return GoalSelection(float('nan'), float('nan'), 0, 'ALL_BLACKLISTED')
 
@@ -85,7 +86,7 @@ class GoalManager:
         stuck_info = self._check_and_blacklist_if_stuck(candidates, robot_xy, now)
         event = 'STUCK_BLACKLIST' if stuck_info else ''
         if stuck_info:
-            candidates = [c for c in candidates if not self.is_blacklisted(c.wx, c.wy, now)]
+            candidates = [c for c in candidates if not self.is_blacklisted(c.wx, c.wy)]
             if not candidates:
                 return GoalSelection(float('nan'), float('nan'), 0, event, stuck_info)
 

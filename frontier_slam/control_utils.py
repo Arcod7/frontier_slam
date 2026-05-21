@@ -6,15 +6,14 @@ Thruster mixing convention (BlueROV2 vectored, NED body frame, scn-file order):
   1      FrontLeft    surge + yaw
   2      BackRight   -surge + yaw
   3      BackLeft    -surge - yaw
-  4      VertFront    heave   (positive = upward in NED)
+  4      VertFront    heave   (negative = upward thrust in Stonefish)
   5      VertBack     heave
 
 A note on the heave sign:
-  In NED the Z axis points DOWN. Vertical thrusters mounted facing down push
-  water down → push the robot up → so a positive heave command means "go up".
-  The depth-hold law therefore reads `heave = KP * (pose_z - setpoint_z)`:
-  when the robot is deeper than the setpoint (pose_z > setpoint_z), heave > 0,
-  and the robot rises.
+  In NED the Z axis points DOWN. Positive heave pushes the robot further down.
+  The depth-hold law therefore reads `heave = -KP * (pose_z - setpoint_z)`:
+  when the robot is too deep (pose_z > setpoint_z), heave < 0, and the robot
+  rises.
 """
 import math
 
