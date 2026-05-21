@@ -1,7 +1,9 @@
 """Pure functions for detecting frontier clusters in an OccupancyGrid.
 
-A frontier cell is FREE (=0) and directly adjacent to UNKNOWN (<0). The 2D
-projected map from OctoMap satisfies this convention.
+A frontier cell is OCCUPIED (=100) and directly adjacent to UNKNOWN (<0). These
+wall-surface cells are stable targets: they don't recede as the robot approaches,
+and navigating near them lets the sonar illuminate the unknown space beyond the wall
+from a new angle. The 2D projected map from OctoMap satisfies this convention.
 """
 from dataclasses import dataclass
 
@@ -28,10 +30,10 @@ def find_frontier_clusters(grid_msg, min_cluster_cells: int = 5) -> list:
     oy  = grid_msg.info.origin.position.y
     w, h = grid_msg.info.width, grid_msg.info.height
 
-    grid    = np.array(grid_msg.data, dtype=np.int8).reshape(h, w)
-    free    = (grid == 0)
-    unknown = (grid < 0)
-    frontier = free & binary_dilation(unknown)
+    grid     = np.array(grid_msg.data, dtype=np.int8).reshape(h, w)
+    occupied = (grid == 100)
+    unknown  = (grid < 0)
+    frontier = occupied & binary_dilation(unknown)
 
     labeled, n = label(frontier)
     if n == 0:

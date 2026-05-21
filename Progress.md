@@ -1478,12 +1478,43 @@ thrust in Stonefish). Now states "negative = upward thrust in Stonefish" consist
 
 ---
 
+## Change 43 — Frontier definition: occupied↔unknown instead of free↔unknown + MIN_CLUSTER_CELLS=1
+
+**Date**: 2026-05-21  
+**Files**: `frontier_detection.py`, `frontier_extractor.py`
+
+**Objective**: Free↔unknown frontiers are unstable targets in a sonar-based system: the boundary
+recedes as the robot approaches because the sonar fills in cells ahead as free. The robot commits
+to a goal that no longer exists by the time it arrives.
+
+Occupied↔unknown frontiers are stable: the wall surface is fixed, and navigating near it lets
+the sonar illuminate the unknown space on the other side from a new angle (around corners, behind
+pillars, etc.). These are genuine "something to investigate" targets rather than "edge of what
+was scanned so far" targets.
+
+**Changes in `frontier_detection.py`**:
+- `frontier = free & binary_dilation(unknown)` → `frontier = occupied & binary_dilation(unknown)`
+- Module docstring updated to reflect the new definition.
+
+**Changes in `frontier_extractor.py`**:
+- `MIN_CLUSTER_CELLS = 5` → `MIN_CLUSTER_CELLS = 1`. Wall-surface clusters tend to be small
+  (a single isolated pillar corner is 1–3 cells), so requiring 5 would filter most of them out.
+
+**Navigation behaviour**: Cluster centroids now fall on occupied cells. A* snaps goal cells to
+the nearest free cell via `nearest_free`, so the robot navigates to the closest accessible point
+near the wall surface rather than into it. The existing inflation zones keep the planned path at
+a safe distance.
+
+**Observed impact**: 🔲 Not yet tested.
+
+---
+
 ## Current parameter snapshot
 
 ### frontier_extractor.py / goal_manager.py
 | Parameter | Value | Purpose |
 |---|---|---|
-| `MIN_CLUSTER_CELLS` | 5 | Discard tiny frontier clusters (noise) |
+| `MIN_CLUSTER_CELLS` | 1 | Discard tiny frontier clusters (noise); lowered for small wall-surface clusters (Ch43) |
 | `MIN_EXPLORE_DIST` | 3.0 m | Skip frontiers the robot is already at |
 | `GOAL_VANISH_DIST` | 3.0 m | Committed goal "gone" if no cluster within this radius |
 | `GOAL_RADIUS` | 2.0 m | Robot "arrived" threshold — GoalManager switches when cur_dist ≤ this (Ch28) |
@@ -1696,3 +1727,27 @@ the 5-minute session contributed only 2,994 cells. The bottleneck is not obstacl
 or navigation — it is goal selection. Nearest-first with 23 equidistant clusters generates
 a random walk among visited frontiers rather than directing the robot toward large unknown
 regions. Frontier scoring is the next necessary change.
+
+---
+
+## Change 44 — FutureWork.md: fill gaps identified vs literature
+
+**Date**: 2026-05-21  
+**Files**: `FutureWork.md`
+
+**Objective**: Three gaps relative to the active-SLAM literature were not captured:
+
+1. **§5 (3-D frontiers)**: Added note on TSDF/ESDF (voxblox/nvblox) as an alternative
+   volumetric representation — provides surface gradients and signed distance as first-class
+   fields, which removes the three-zone inflation pass and makes standoff selection trivial.
+
+2. **§6 (Active SLAM)**: Expanded the NextBestView description to name the
+   unmapped-volume-in-frustum formulation (ray-cast candidate viewpoints, count unseen
+   voxels, divide by path cost) and note that it removes the need for the oscillation
+   band-aids (stuck detection, blacklisting).
+
+3. **§7 (Evaluation) — new section**: Added four concrete metrics for comparing baseline
+   vs improved policy: coverage % against a reference OctoMap, ATE (requires §4 first),
+   path efficiency (distance / coverage), and stuck-event count (already logged).
+
+**Observed impact**: 🔲 Documentation only.

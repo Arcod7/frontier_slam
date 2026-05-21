@@ -2,7 +2,7 @@
 
 Subscribes to /projected_map (the 2-D OctoMap projection) and /StoneFish/Odometry.
 On each tick it:
-  1. Finds free-cell ↔ unknown-cell boundaries (frontiers) and clusters them.
+  1. Finds occupied-cell ↔ unknown-cell boundaries (frontiers) and clusters them.
   2. Lets a GoalManager pick the next goal, with hysteresis, stuck detection,
      and a timed blacklist for unreachable goals.
   3. Publishes the goal on /frontier_slam/goal and an RViz MarkerArray on
@@ -45,13 +45,17 @@ CSV_COLUMNS = [
 
 
 class FrontierExtractor(Node):
-    MIN_CLUSTER_CELLS = 5
+    MIN_CLUSTER_CELLS = 1
     UPDATE_HZ         = 0.5
     REPLAN_HZ         = 3.0
     REPLAN_FAIL_MAX   = 6    # consecutive A* failures before blacklisting goal as unreachable
 
     def __init__(self):
         super().__init__('frontier_extractor')
+
+        self.declare_parameter('depth_setpoint', -1.0)
+        v = float(self.get_parameter('depth_setpoint').value)
+        self._depth_setpoint: float | None = None if v < 0 else v
 
         self._map: OccupancyGrid | None = None
         self._robot_pos: np.ndarray | None = None
@@ -76,7 +80,7 @@ class FrontierExtractor(Node):
 
         self._log = open_session_log('extractor', CSV_COLUMNS, _LOG_DIR)
 
-        self.create_subscription(OccupancyGrid, '/projected_map',     self._map_cb,  1)
+        self.create_subscription(OccupancyGrid, '/projected_map',      self._map_cb,  1)
         self.create_subscription(Odometry,      '/StoneFish/Odometry', self._odom_cb, 10)
         self._goal_pub = self.create_publisher(PointStamped, '/frontier_slam/goal',      1)
         self._path_pub = self.create_publisher(Path,         '/frontier_slam/path',      1)
@@ -350,7 +354,8 @@ class FrontierExtractor(Node):
         img = np.zeros((h, w, 3), dtype=np.uint8)
         img[raw == -1] = (80,  80,  80)   # unknown
         img[raw == 0]  = (210, 210, 210)  # free
-        img[raw == 100]= (20,  20,  20)   # occupied
+
+        img[raw == 100] = (20, 20, 20)    # occupied
 
         if self._cg is not None and self._cg.raw.shape == (h, w):
             p = PAD_CELLS

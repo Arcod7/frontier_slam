@@ -71,11 +71,16 @@ class WaypointController(Node):
     def __init__(self):
         super().__init__('waypoint_controller')
 
+        self.declare_parameter('depth_setpoint', -1.0)
+        v = float(self.get_parameter('depth_setpoint').value)
+        self._depth_setpoint: float | None = None if v < 0 else v
+        if self._depth_setpoint is not None:
+            self.get_logger().info(f'depth setpoint from launch param: {self._depth_setpoint:.2f} m')
+
         self._goal: np.ndarray | None = None
         self._pose: np.ndarray | None = None
         self._yaw  = 0.0
         self._min_front_dist      = float('inf')
-        self._depth_setpoint: float | None = None
         self._init_scan_end: float | None  = None   # set on first odom
         self._goal_reached_at: float | None = None
         self._path: list  = []    # [(wx, wy), ...] from /frontier_slam/path
@@ -135,11 +140,14 @@ class WaypointController(Node):
         p = msg.pose.pose.position
         self._pose = np.array([p.x, p.y, p.z])
         self._yaw  = yaw_from_quat(msg.pose.pose.orientation)
-        if self._depth_setpoint is None:
-            self._depth_setpoint = float(p.z)
-            self._init_scan_end  = self._t_ros() + self.INIT_SCAN_DURATION
+        if self._init_scan_end is None:   # first odom
+            if self._depth_setpoint is None:
+                self._depth_setpoint = float(p.z)
+                self.get_logger().info(
+                    f'depth setpoint locked from odom at {self._depth_setpoint:.2f} m'
+                )
+            self._init_scan_end = self._t_ros() + self.INIT_SCAN_DURATION
             self.get_logger().info(
-                f'depth setpoint locked at {self._depth_setpoint:.2f} m — '
                 f'initial {self.INIT_SCAN_DURATION:.0f}s scan starting'
             )
 
