@@ -7,14 +7,12 @@ Panels:
         - /Global Options1
         - /Status1
         - /Sonar3D1/Topic1
-        - /Octomap1/Status1
         - /Octomap1/Topic1
         - /Octomap1/Namespaces1
         - /Odometry1/Shape1
-        - /Map1/Position1
         - /Frontiers1/Namespaces1
         - /Path1
-        - /Map2
+        - /OccupancyGrid1/Status1
       Splitter Ratio: 0.5721455216407776
     Tree Height: 1108
   - Class: rviz_common/Selection
@@ -70,10 +68,10 @@ Visualization Manager:
         Value: /sensor_msgs/image_depth
       Value: false
       Visibility:
+        "": true
         DepthCamera: true
         Frontiers: true
         Grid: true
-        Map: true
         Octomap: true
         OctomapPoints: true
         Odometry: true
@@ -291,6 +289,40 @@ Visualization Manager:
         Reliability Policy: Reliable
         Value: /frontier_slam/path
       Value: true
+    - Class: octomap_rviz_plugins/OccupancyGrid
+      Enabled: true
+      Max. Height Display: inf
+      Max. Octree Depth: 16
+      Min. Height Display: -inf
+      Name: OccupancyGrid
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /octomap_binary
+      Value: true
+      Voxel Alpha: 0.019999999552965164
+      Voxel Coloring: Z-Axis
+      Voxel Rendering: Free Voxels
+    - Class: octomap_rviz_plugins/OccupancyGrid
+      Enabled: false
+      Max. Height Display: inf
+      Max. Octree Depth: 16
+      Min. Height Display: -inf
+      Name: OccupancyGrid
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /octomap_binary
+      Value: false
+      Voxel Alpha: 1
+      Voxel Coloring: Z-Axis
+      Voxel Rendering: Occupied Voxels
   Enabled: true
   Global Options:
     Background Color: 48; 48; 48
@@ -352,10 +384,10 @@ Visualization Manager:
       Invert Z Axis: true
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.6314564347267151
+      Pitch: 0.5264564156532288
       Target Frame: <Fixed Frame>
       Value: Orbit (rviz)
-      Yaw: 6.1085286140441895
+      Yaw: 2.8885183334350586
     Saved: ~
 Window Geometry:
   Camera:
@@ -377,5 +409,5 @@ Window Geometry:
   Views:
     collapsed: true
   Width: 2512
-  X: 56
-  Y: 62
+  X: 22
+  Y: 34

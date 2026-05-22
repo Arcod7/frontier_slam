@@ -1376,3 +1376,26 @@ true vFOV.
 4. `simple_rov.scn`: updated sensor specs to match WaterLinked Sonar 3D-15 datasheet (low-frequency mode) — `resolution_x` 128→257 (90°/0.35°), `resolution_y` 32→67 (40°/0.60°), `vertical_fov="40.0"` now takes effect.
 
 **Observed impact**: 🔲 Requires stonefish rebuild + colcon rebuild to take effect.
+
+---
+
+## Change 46 — Extract visualisation into FrontierVisualizer
+
+**Date**: 2026-05-22  
+**Files**:
+- `slam_ws/src/frontier_slam/frontier_slam/visualizer.py` (new)
+- `slam_ws/src/frontier_slam/frontier_slam/frontier_extractor.py`
+
+**Objective**: `frontier_extractor.py` was doing six distinct jobs. Extract the three
+visualisation concerns (RViz markers, inflated-map overlay, debug image) into a dedicated
+`FrontierVisualizer` class.
+
+**Fix**:
+- New `visualizer.py`: `FrontierVisualizer` class owns the three publishers and exposes
+  `publish_markers()`, `publish_inflated_map()`, `publish_debug_image()`. Module-level
+  helpers `_sphere`, `_draw_line`, `_arrow_color` moved here.
+- `frontier_extractor.py`: instantiates `FrontierVisualizer(self)`, delegates all
+  rendering calls to it. File shrinks from 445 → 240 lines. Removed imports:
+  `Duration`, `Point`, `Image`, `ColorRGBA`, `Marker`, `MarkerArray`, `PAD_CELLS`.
+
+**Observed impact**: 🔲 Not yet run in a session.

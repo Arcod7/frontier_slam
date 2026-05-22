@@ -5,8 +5,8 @@ On each tick it:
   1. Finds occupied-cell ↔ unknown-cell boundaries (frontiers) and clusters them.
   2. Lets a GoalManager pick the next goal, with hysteresis, stuck detection,
      and a timed blacklist for unreachable goals.
-  3. Publishes the goal on /frontier_slam/goal and an RViz MarkerArray on
-     /frontier_slam/frontiers.
+  3. Publishes the goal on /frontier_slam/goal and the A*-planned path on
+     /frontier_slam/path.  Visualisation is delegated to FrontierVisualizer.
 
 The goal's Z is set to the robot's current Z — but only for marker placement.
 The waypoint controller maintains its own fixed depth setpoint and ignores
@@ -18,18 +18,15 @@ import os
 import numpy as np
 import rclpy
 from rclpy.node import Node
-from builtin_interfaces.msg import Duration
-from geometry_msgs.msg import Point, PointStamped, PoseStamped
+from geometry_msgs.msg import PointStamped, PoseStamped
 from nav_msgs.msg import OccupancyGrid, Odometry, Path
-from sensor_msgs.msg import Image
-from std_msgs.msg import ColorRGBA
-from visualization_msgs.msg import Marker, MarkerArray
 
 from frontier_slam.control_utils import yaw_from_quat
 from frontier_slam.frontier_detection import find_frontier_clusters
 from frontier_slam.goal_manager import GoalManager
-from frontier_slam.path_planner import PAD_CELLS, CostGrid, build_cost_grid, find_path
+from frontier_slam.path_planner import CostGrid, build_cost_grid, find_path
 from frontier_slam.session_log import open_session_log
+from frontier_slam.visualizer import FrontierVisualizer
 
 
 _LOG_DIR = os.path.join(
@@ -82,11 +79,9 @@ class FrontierExtractor(Node):
 
         self.create_subscription(OccupancyGrid, '/projected_map',      self._map_cb,  1)
         self.create_subscription(Odometry,      '/StoneFish/Odometry', self._odom_cb, 10)
-        self._goal_pub = self.create_publisher(PointStamped, '/frontier_slam/goal',      1)
-        self._path_pub = self.create_publisher(Path,         '/frontier_slam/path',      1)
-        self._viz_pub          = self.create_publisher(MarkerArray,   '/frontier_slam/frontiers',    1)
-        self._inflated_map_pub = self.create_publisher(OccupancyGrid, '/frontier_slam/inflated_map', 1)
-        self._debug_img_pub    = self.create_publisher(Image,         '/frontier_slam/debug_image',  1)
+        self._goal_pub = self.create_publisher(PointStamped, '/frontier_slam/goal', 1)
+        self._path_pub = self.create_publisher(Path,         '/frontier_slam/path', 1)
+        self._viz      = FrontierVisualizer(self)
 
         self.create_timer(1.0 / self.UPDATE_HZ,  self._update)
         self.create_timer(1.0 / self.REPLAN_HZ,  self._replan)
@@ -181,13 +176,12 @@ class FrontierExtractor(Node):
     # Publishing
     def _publish_goal(self, gx: float, gy: float, clusters: list) -> None:
         self._current_goal_xy = np.array([gx, gy])
-        gz = float(self._robot_pos[2])   # only used for marker placement
         goal = PointStamped()
         goal.header.stamp    = self.get_clock().now().to_msg()
         goal.header.frame_id = 'world_ned'
-        goal.point.x, goal.point.y, goal.point.z = gx, gy, gz
+        goal.point.x, goal.point.y, goal.point.z = gx, gy, float(self._robot_pos[2])
         self._goal_pub.publish(goal)
-        self._publish_viz(clusters, gx, gy, gz)
+        self._viz.publish_markers(clusters, gx, gy, self._robot_pos)
 
     def _replan(self) -> None:
         if self._map is None or self._robot_pos is None:
@@ -239,185 +233,12 @@ class FrontierExtractor(Node):
                         f'({self._astar_fail_count}/{self.REPLAN_FAIL_MAX})'
                     )
         self._path_pub.publish(path)
-        self._publish_inflated_map()
-        self._publish_debug_image()
-
-    def _publish_viz(self, clusters: list, gx: float, gy: float, gz: float) -> None:
-        markers = MarkerArray()
-        now = self.get_clock().now().to_msg()
-        lifetime = Duration(sec=3)
-
-        for i, c in enumerate(clusters):
-            markers.markers.append(self._sphere(
-                ns='frontiers', mid=i, x=c.wx, y=c.wy, z=self._robot_pos[2],
-                scale=0.4, rgba=(0.0, 1.0, 1.0, 0.6),
-                stamp=now, lifetime=lifetime,
-            ))
-        markers.markers.append(self._sphere(
-            ns='goal', mid=0, x=gx, y=gy, z=gz,
-            scale=0.8, rgba=(1.0, 0.0, 0.0, 0.9),
-            stamp=now, lifetime=lifetime,
-        ))
-        # Arrow pointing at the goal — tail is 2 m behind the goal along the approach vector,
-        # head is at the goal itself, showing the heading the robot needs to hold.
-        dx, dy = gx - self._robot_pos[0], gy - self._robot_pos[1]
-        dist = math.hypot(dx, dy)
-        if dist > 0.5:
-            arrow_len = min(2.0, dist * 0.8)
-            ux, uy = dx / dist, dy / dist
-            arrow = Marker()
-            arrow.header.stamp    = now
-            arrow.header.frame_id = 'world_ned'
-            arrow.ns      = 'goal_arrow'
-            arrow.id      = 0
-            arrow.type    = Marker.ARROW
-            arrow.action  = Marker.ADD
-            arrow.points  = [
-                Point(x=gx - ux * arrow_len, y=gy - uy * arrow_len, z=gz),
-                Point(x=gx, y=gy, z=gz),
-            ]
-            arrow.scale.x = 0.15   # shaft diameter
-            arrow.scale.y = 0.35   # head diameter
-            arrow.color   = ColorRGBA(r=1.0, g=0.5, b=0.0, a=0.9)
-            arrow.lifetime = lifetime
-            markers.markers.append(arrow)
-        self._viz_pub.publish(markers)
-
-    @staticmethod
-    def _sphere(*, ns, mid, x, y, z, scale, rgba, stamp, lifetime) -> Marker:
-        m = Marker()
-        m.header.stamp = stamp
-        m.header.frame_id = 'world_ned'
-        m.ns = ns
-        m.id = mid
-        m.type = Marker.SPHERE
-        m.action = Marker.ADD
-        m.pose.position.x, m.pose.position.y, m.pose.position.z = x, y, z
-        m.pose.orientation.w = 1.0
-        m.scale.x = m.scale.y = m.scale.z = scale
-        m.color = ColorRGBA(r=rgba[0], g=rgba[1], b=rgba[2], a=rgba[3])
-        m.lifetime = lifetime
-        return m
-
-    # ------------------------------------------------------------------
-    # Debug visualisation
-    def _publish_inflated_map(self) -> None:
-        if self._map is None or self._cg is None:
-            return
-        info = self._map.info
-        if self._cg.raw.shape != (info.height, info.width):
-            return
-        raw = self._cg.raw
-        out = raw.copy()
-        p   = PAD_CELLS
-        out[self._cg.plan_zone[p:-p, p:-p]    & (raw != 100)] = 35  # planning zone → 35
-        out[self._cg.soft_zone[p:-p, p:-p]    & (raw != 100)] = 50  # soft zone → 50
-        out[self._cg.hard_blocked[p:-p, p:-p] & (raw != 100)] = 75  # hard zone → 75
-        msg = OccupancyGrid()
-        msg.header.stamp    = self.get_clock().now().to_msg()
-        msg.header.frame_id = 'world_ned'
-        msg.info            = self._map.info
-        msg.data            = out.flatten().tolist()
-        self._inflated_map_pub.publish(msg)
-
-    @staticmethod
-    def _draw_line(img: np.ndarray, r0: int, c0: int, r1: int, c1: int,
-                   color: tuple) -> None:
-        """Draw a 1-pixel line by interpolation (no external deps)."""
-        n = max(abs(r1 - r0), abs(c1 - c0), 1)
-        rs = np.round(np.linspace(r0, r1, n)).astype(int)
-        cs = np.round(np.linspace(c0, c1, n)).astype(int)
-        h, w = img.shape[:2]
-        ok = (rs >= 0) & (rs < h) & (cs >= 0) & (cs < w)
-        img[rs[ok], cs[ok]] = color
-
-    def _robot_arrow_color(self) -> tuple:
-        if self._current_goal_xy is None:
-            return (0, 200, 200)   # cyan  = scanning / no valid goal
-        if self._last_stuck_pct >= 100:
-            return (220, 100, 0)   # orange = maxed stuck
-        if self._last_stuck_pct >= 50:
-            return (220, 220, 0)   # yellow = approaching stuck timeout
-        return (50, 150, 255)      # blue  = navigating normally
-
-    def _publish_debug_image(self) -> None:
-        if self._map is None or self._robot_pos is None:
-            return
-        info = self._map.info
-        h, w = info.height, info.width
-        res  = info.resolution
-        ox   = info.origin.position.x
-        oy   = info.origin.position.y
-
-        raw = (self._cg.raw if (self._cg is not None and self._cg.raw.shape == (h, w))
-               else np.asarray(self._map.data, dtype=np.int8).reshape(h, w))
-        img = np.zeros((h, w, 3), dtype=np.uint8)
-        img[raw == -1] = (80,  80,  80)   # unknown
-        img[raw == 0]  = (210, 210, 210)  # free
-
-        img[raw == 100] = (20, 20, 20)    # occupied
-
-        if self._cg is not None and self._cg.raw.shape == (h, w):
-            p = PAD_CELLS
-            img[self._cg.plan_zone[p:-p, p:-p]    & (raw != 100)] = (180, 160, 60)  # planning zone
-            img[self._cg.soft_zone[p:-p, p:-p]    & (raw != 100)] = (200, 100, 50)  # soft zone
-            img[self._cg.hard_blocked[p:-p, p:-p] & (raw != 100)] = (150, 30,  30)  # hard zone
-
-        # Path as connected line segments (green)
-        if self._current_path:
-            pts = [(int((wy - oy) / res), int((wx - ox) / res))
-                   for wx, wy in self._current_path]
-            for i in range(len(pts) - 1):
-                self._draw_line(img, pts[i][0], pts[i][1],
-                                pts[i + 1][0], pts[i + 1][1], (0, 220, 0))
-
-        # Goal: red cross
-        if self._current_goal_xy is not None:
-            gc = int((self._current_goal_xy[0] - ox) / res)
-            gr = int((self._current_goal_xy[1] - oy) / res)
-            if 0 <= gr < h and 0 <= gc < w:
-                for d in range(-4, 5):
-                    if 0 <= gr + d < h: img[gr + d, gc] = (220, 50, 50)
-                    if 0 <= gc + d < w: img[gr, gc + d] = (220, 50, 50)
-
-        # Robot: arrow aligned to heading, length ∝ speed
-        # Pre-flip coords: col↔X(North/right), row↔Y(East/down-before-flip→up-after)
-        # dc=cos(yaw), dr=sin(yaw) maps correctly after flipud.
-        rc = int((self._robot_pos[0] - ox) / res)
-        rr = int((self._robot_pos[1] - oy) / res)
-        arm = max(4, int(4 + self._robot_speed * 20))   # pixels; ~10px at MAX_SURGE
-        dc  = int(round(math.cos(self._robot_yaw) * arm))
-        dr  = int(round(math.sin(self._robot_yaw) * arm))
-        color = self._robot_arrow_color()
-        if 0 <= rr < h and 0 <= rc < w:
-            self._draw_line(img, rr, rc, rr + dr, rc + dc, color)
-            # 3×3 body dot at tail
-            img[max(0, rr - 1):min(h, rr + 2), max(0, rc - 1):min(w, rc + 2)] = color
-            # 3×3 arrowhead dot at tip
-            tr, tc = rr + dr, rc + dc
-            if 0 <= tr < h and 0 <= tc < w:
-                img[max(0, tr - 1):min(h, tr + 2), max(0, tc - 1):min(w, tc + 2)] = color
-
-        # Flip vertical axis (OccupancyGrid row-0 = south, image row-0 = top)
-        out = np.flipud(img)
-
-        # 4-pixel status bar at top — colour encodes robot state
-        bar = ((0, 150, 150) if self._current_goal_xy is None else
-               (200, 80,  0) if self._last_stuck_pct >= 100      else
-               (200, 200, 0) if self._last_stuck_pct >= 50       else
-               (0,  120,  0))
-        out[0:4, :] = bar
-
-        msg = Image()
-        msg.header.stamp    = self.get_clock().now().to_msg()
-        msg.header.frame_id = 'world_ned'
-        msg.height          = h
-        msg.width           = w
-        msg.encoding        = 'rgb8'
-        msg.is_bigendian    = False
-        msg.step            = w * 3
-        msg.data            = out.tobytes()
-        self._debug_img_pub.publish(msg)
+        self._viz.publish_inflated_map(self._cg, self._map)
+        self._viz.publish_debug_image(
+            self._cg, self._map,
+            self._robot_pos, self._robot_yaw, self._robot_speed,
+            self._current_path, self._current_goal_xy, self._last_stuck_pct,
+        )
 
     # ------------------------------------------------------------------
     # Logging
