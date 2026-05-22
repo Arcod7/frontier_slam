@@ -136,11 +136,6 @@ def find_path(cg: CostGrid, robot_xy: np.ndarray, goal_xy: np.ndarray) -> list:
     return [to_world(r, c) for r, c in _thin(cells)]
 
 
-def plan_path(grid_msg, robot_xy: np.ndarray, goal_xy: np.ndarray) -> list:
-    """Convenience wrapper: build cost grid and find path in one call."""
-    return find_path(build_cost_grid(grid_msg), robot_xy, goal_xy)
-
-
 def _astar(cost_grid: np.ndarray, start: tuple, goal: tuple) -> list | None:
     """A* on a float cost_grid, 8-connectivity.
 

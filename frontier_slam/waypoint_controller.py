@@ -77,6 +77,9 @@ class WaypointController(Node):
         if self._depth_setpoint is not None:
             self.get_logger().info(f'depth setpoint from launch param: {self._depth_setpoint:.2f} m')
 
+        self.declare_parameter('odom_topic', '/StoneFish/Odometry')
+        odom_topic = str(self.get_parameter('odom_topic').value)
+
         self._goal: np.ndarray | None = None
         self._pose: np.ndarray | None = None
         self._yaw  = 0.0
@@ -94,7 +97,7 @@ class WaypointController(Node):
 
         self.create_subscription(PointStamped, '/frontier_slam/goal',        self._goal_cb,  1)
         self.create_subscription(Path,         '/frontier_slam/path',        self._path_cb,  1)
-        self.create_subscription(Odometry,     '/StoneFish/Odometry',        self._odom_cb,  10)
+        self.create_subscription(Odometry,     odom_topic,                   self._odom_cb,  10)
         self.create_subscription(Image,        '/sensor_msgs/image_depth',   self._depth_cb, 1)
         self._thrust_pub = self.create_publisher(
             Float64MultiArray, '/bluerov2/controller/thruster_setpoints_sim', 1,

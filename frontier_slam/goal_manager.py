@@ -20,7 +20,7 @@ class GoalSelection:
     stuck_pct: int        # 0–100, percent of stuck timeout elapsed on current goal
     event: str = ''       # '', 'STUCK_BLACKLIST', 'ALL_BLACKLISTED'
     # Populated only when event == 'STUCK_BLACKLIST', for user-facing logging.
-    stuck_goal: tuple = None     # (x, y, elapsed_s, progress_m)
+    stuck_goal: tuple | None = None     # (x, y, elapsed_s, progress_m)
 
 
 class GoalManager:

@@ -12,7 +12,7 @@ Current coverage: controller + extractor CSV format as of Change 19 (frontier sc
 
 Column reference:
   controller: t_ros, rx, ry, rz, gx, gy, gz, dist_m, hdg_err_deg, depth_err_m,
-               surge, yaw_cmd, heave, obs_m, blocked, event
+               surge, yaw_cmd, heave, obs_m, path_len, wp_idx, event
   extractor:  t_ros, rx, ry, rz, gx, gy, dist_m, clusters, stuck_pct,
                blacklist_n, free_cells, occ_cells, mapped_cells, event
 """
@@ -74,23 +74,6 @@ def _odometer(ctrl: list) -> float:
         total += math.hypot(dx, dy)
     return total
 
-
-def _max_consecutive_blocked(ctrl: list) -> tuple[int, tuple]:
-    """Returns (max_run_length, (rx, ry) at start of that run)."""
-    best, run = 0, 0
-    best_pos = (float('nan'), float('nan'))
-    run_start_pos = (float('nan'), float('nan'))
-    for r in ctrl:
-        if int(_f(r, 'blocked', 0)):
-            if run == 0:
-                run_start_pos = (_f(r, 'rx'), _f(r, 'ry'))
-            run += 1
-            if run > best:
-                best = run
-                best_pos = run_start_pos
-        else:
-            run = 0
-    return best, best_pos
 
 
 def _goal_commits(ext: list) -> list[dict]:
@@ -171,9 +154,8 @@ def report(prefix: str, ctrl: list, ext: list) -> dict:
     m_end    = int(_f(ext[-1], 'mapped_cells', 0))
     m_gain   = m_end - m_start
 
-    blocked_ticks  = sum(1 for r in ctrl if int(_f(r, 'blocked', 0)))
-    blocked_frac   = blocked_ticks / max(1, len(ctrl))
-    max_bl_run, bl_pos = _max_consecutive_blocked(ctrl)
+    emerg_stops  = sum(1 for r in ctrl if r.get('event') == 'EMERG_STOP')
+    ctrl_stucks  = sum(1 for r in ctrl if r.get('event') == 'CTRL_STUCK')
     odo            = _odometer(ctrl)
     commits        = _goal_commits(ext)
     stuck_evs      = _stuck_events(ext)
@@ -224,21 +206,18 @@ def report(prefix: str, ctrl: list, ext: list) -> dict:
             print(f'    t={ev["t_rel"]:5.0f}s  robot=({ev["rx"]:.1f},{ev["ry"]:.1f})'
                   f'  blacklisted=({ev["gx"]:.1f},{ev["gy"]:.1f})')
 
-    # ── Obstacle / BLOCKED ─────────────────────────────────────────
-    print(f'\n── Obstacle / BLOCKED ────────────────────────────────────')
-    print(f'  BLOCKED ticks         {blocked_ticks} / {len(ctrl)}  ({blocked_frac*100:.1f}%)')
-    print(f'  Max consecutive run   {max_bl_run} ticks  '
-          f'at ({bl_pos[0]:.1f},{bl_pos[1]:.1f})')
+    # ── Obstacle events ────────────────────────────────────────────
+    print(f'\n── Obstacle events ───────────────────────────────────────')
+    print(f'  EMERG_STOP events     {emerg_stops}')
+    print(f'  CTRL_STUCK events     {ctrl_stucks}')
 
-    # Count lateral readings if present (Change 20+)
+    # Lateral sonar columns (future: obs_left_m, obs_right_m)
     has_lateral = 'obs_left_m' in (ctrl[0] if ctrl else {})
     if has_lateral:
         left_close  = sum(1 for r in ctrl if _f(r,'obs_left_m',  float('inf')) < 0.8)
         right_close = sum(1 for r in ctrl if _f(r,'obs_right_m', float('inf')) < 0.8)
         print(f'  Left wall (<0.8m)     {left_close} ticks  ({left_close/len(ctrl)*100:.1f}%)')
         print(f'  Right wall (<0.8m)    {right_close} ticks  ({right_close/len(ctrl)*100:.1f}%)')
-    else:
-        print(f'  Lateral readings      not in this log (added Change 20)')
 
     # ── Depth control ─────────────────────────────────────────────
     print(f'\n── Depth control ─────────────────────────────────────────')
@@ -261,8 +240,8 @@ def report(prefix: str, ctrl: list, ext: list) -> dict:
         'ry_min':        min(ry_vals),  'ry_max': max(ry_vals),
         'goal_commits':  len(commits),
         'stuck_events':  len(stuck_evs),
-        'blocked_frac':  blocked_frac,
-        'max_bl_run':    max_bl_run,
+        'emerg_stops':   emerg_stops,
+        'ctrl_stucks':   ctrl_stucks,
         'depth_max_err': depth['max'],
         'depth_frac_03': depth['frac_over_0_3'],
     }
@@ -281,8 +260,8 @@ def compare(m1: dict, m2: dict) -> None:
         ('Robot Y range max',     '',  'ry_max',        '.1f'),
         ('Goal commits',          '',  'goal_commits',  'd'),
         ('STUCK_BLACKLIST',       '',  'stuck_events',  'd'),
-        ('BLOCKED fraction',      '%', 'blocked_frac',  '.1%'),
-        ('Max BLOCKED run (ticks)','', 'max_bl_run',    'd'),
+        ('EMERG_STOP events',      '',  'emerg_stops',   'd'),
+        ('CTRL_STUCK events',      '',  'ctrl_stucks',   'd'),
         ('Depth max error (m)',   '',  'depth_max_err', '+.2f'),
         ('Depth >0.3m fraction',  '%', 'depth_frac_03', '.1%'),
     ]
