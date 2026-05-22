@@ -3,3 +3,4 @@ logs/*.log
 logs/*.txt
 logs/*.bag
 logs/*.csv
+latest.md

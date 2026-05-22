@@ -1751,3 +1751,38 @@ regions. Frontier scoring is the next necessary change.
    path efficiency (distance / coverage), and stuck-event count (already logged).
 
 **Observed impact**: 🔲 Documentation only.
+
+---
+
+## Change 45 — Wire vertical_fov through stonefish DepthCamera; update sensor config to WaterLinked Sonar 3D-15 specs
+
+**Date**: 2026-05-22  
+**Files**:
+- `stonefish/Library/include/sensors/vision/DepthCamera.h`
+- `stonefish/Library/src/sensors/vision/DepthCamera.cpp`
+- `stonefish/Library/src/core/ScenarioParser.cpp`
+- `slam_ws/src/stonefish_ros2/src/stonefish_ros2/ROS2Interface.cpp`
+- `slam_ws/src/world/data/robot/simple_rov.scn`
+
+**Objective**: `vertical_fov` in `.scn` files was silently ignored for `depthcamera` sensors
+(ScenarioParser never read it, DepthCamera constructor never accepted it). The actual vFOV
+was derived from the resolution aspect ratio, so the config value was misleading. Additionally,
+the published `CameraInfo` intrinsics (`fy`) were also computed from aspect ratio, not the
+true vFOV.
+
+**Fix**:
+1. `ScenarioParser`: reads optional `vertical_fov` attribute for `depthcamera` and passes it to the constructor.
+2. `DepthCamera`: added `vFOVDeg` parameter (default -1 = aspect-ratio fallback), stores as `fovV`, passes through to `OpenGLDepthCamera` (which already handled it).
+3. `ROS2Interface::GenerateCameraMsgPrototypes`: when cam is a `DepthCamera` with explicit vFOV, uses `tan(vfov/2)` directly for `fy` instead of the aspect-ratio approximation.
+4. `simple_rov.scn`: updated sensor specs to match WaterLinked Sonar 3D-15 datasheet (low-frequency mode):
+   - `resolution_x`: 128 → **257** (= 90° / 0.35° beam separation)
+   - `resolution_y`: 32 → **67** (= 40° / 0.60° beam separation)
+   - `vertical_fov="40.0"` now actually takes effect
+   - `horizontal_fov`, `depth_min`, `depth_max` unchanged
+
+**Current parameter snapshot** (sensor):
+```
+hFOV=90°  vFOV=40°  resX=257  resY=67  depth_min=0.2m  depth_max=15m
+```
+
+**Observed impact**: 🔲 Requires stonefish rebuild + colcon rebuild to take effect.
